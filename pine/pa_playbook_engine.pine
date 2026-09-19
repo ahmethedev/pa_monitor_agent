@@ -1,0 +1,474 @@
+//@version=6
+indicator("MPA | Playbook MTF + Sweep Retest v0.1", overlay = true, max_bars_back = 500, max_boxes_count = 100, max_labels_count = 150)
+
+// Standalone indicator. Setup alerts are not broker orders or position tracking.
+// Implementation choices, timing and installation: playbook_engine.md.
+string G_TF = "1. Zaman dilimleri ve yapi"
+string biasTf = input.timeframe("1D", "Ana bias", options = ["1D", "1W"], group = G_TF)
+string contextTf = input.timeframe("240", "Kritik seviye / HTF sweep", options = ["120", "240", "1D"], group = G_TF)
+string confirmTf = input.timeframe("45", "ChoCh onay", options = ["15", "30", "45", "60"], group = G_TF)
+int swingLen = input.int(5, "Swing pivot: sol / sag", minval = 3, maxval = 20, group = G_TF)
+int internalLen = input.int(2, "Internal pivot: sol / sag", minval = 1, maxval = 10, group = G_TF)
+float breakBuffer = input.float(0.05, "Yapi kirilimi kapanis payi / ATR", minval = 0, step = 0.05, group = G_TF)
+float sweepBuffer = input.float(0.10, "Minimum sweep tasmasi / ATR", minval = 0, step = 0.05, group = G_TF)
+int regimeLen = input.int(20, "Sikisma adayi penceresi", minval = 10, maxval = 100, group = G_TF)
+float efficiencyMax = input.float(0.25, "Sikisma: maksimum net yol / toplam yol", minval = 0.05, maxval = 0.7, step = 0.05, group = G_TF)
+float compressionMax = input.float(6.0, "Sikisma: maksimum genislik / ATR", minval = 1, step = 0.5, group = G_TF)
+
+string G_SETUP = "2. Setup adaylari"
+bool use4A = input.bool(true, "4A: HTF seviyede internal sweep + Breaker", group = G_SETUP)
+bool use5A = input.bool(true, "5A: HTF swing sweep + LTF ChoCh", group = G_SETUP)
+string directionInput = input.string("Iki yon", "Yon", options = ["Iki yon", "Long", "Short"], group = G_SETUP)
+string biasPolicy = input.string("Ters yone izin ver", "Reversal icin ana bias filtresi", options = ["Ters yone izin ver", "Yalniz ana bias yonu"], group = G_SETUP)
+float levelNearAtr = input.float(0.35, "4A kritik seviye yakinligi / HTF ATR", minval = 0, step = 0.05, group = G_SETUP)
+int confirmWait = input.int(8, "ChoCh bekleme: onay TF mum suresi", minval = 1, maxval = 48, group = G_SETUP)
+int retestWait = input.int(8, "Retest bekleme: onay TF mum suresi", minval = 1, maxval = 48, group = G_SETUP)
+int cooldownBars = input.int(12, "Tamamlanan aday sonrasi bekleme: grafik mumu", minval = 1, group = G_SETUP)
+
+string G_CONFIRM = "3. Kirilim ve retest"
+float displacementBody = input.float(0.60, "ChoCh minimum govde / mum araligi", minval = 0.1, maxval = 1, step = 0.05, group = G_CONFIRM)
+float displacementRange = input.float(0.80, "ChoCh minimum mum araligi / ATR", minval = 0.1, step = 0.1, group = G_CONFIRM)
+float displacementClose = input.float(0.10, "ChoCh minimum seviye otesi kapanis / ATR", minval = 0, step = 0.05, group = G_CONFIRM)
+float retestHalfWidth = input.float(0.10, "Retest bandi yari genisligi / onay ATR", minval = 0.01, step = 0.05, group = G_CONFIRM)
+int reactionBars = input.int(3, "Ilk temastan sonra tepki: grafik mum sayisi", minval = 1, maxval = 10, group = G_CONFIRM)
+bool requireCandleDirection = input.bool(true, "Retest tepkisinde yonlu mum iste", group = G_CONFIRM)
+float maximumChase = input.float(0.50, "Bandin otesinde maksimum kapanis uzakligi / onay ATR", minval = 0, step = 0.1, group = G_CONFIRM)
+float stopBuffer = input.float(0.10, "Sweep ucuna stop payi / sweep ATR", minval = 0, step = 0.05, group = G_CONFIRM)
+float minimumRR = input.float(1.50, "Minimum planlanan R/R", minval = 0.5, step = 0.25, group = G_CONFIRM)
+
+string G_VIEW = "4. Gorunum ve bildirim"
+string notifyMode = input.string("Hazir + iptal", "Bildirim asamalari", options = ["Hazir + iptal", "Tum asamalar", "Sadece hazir"], group = G_VIEW)
+bool notifyBias = input.bool(false, "Ana swing bias degisimini bildir", group = G_VIEW)
+bool showLevels = input.bool(true, "HTF swing seviyeleri", group = G_VIEW)
+bool showSetup = input.bool(true, "Aktif setup seviyeleri / kutusu", group = G_VIEW)
+bool showLabels = input.bool(true, "Olay etiketleri", group = G_VIEW)
+bool showBackground = input.bool(false, "HTF fazina gore arka plan", group = G_VIEW)
+
+float chartSeconds = timeframe.in_seconds()
+float biasSeconds = timeframe.in_seconds(biasTf)
+float contextSeconds = timeframe.in_seconds(contextTf)
+float confirmSeconds = timeframe.in_seconds(confirmTf)
+if barstate.isfirst
+    if not chart.is_standard or not timeframe.isintraday
+        runtime.error("Standart intraday mum kullanin. Onerilen grafik: 5 dakika.")
+    if chartSeconds >= confirmSeconds or confirmSeconds >= contextSeconds or contextSeconds >= biasSeconds
+        runtime.error("Grafik TF < Onay TF < HTF < Ana bias TF olmali. Ornek: 5m < 45m < 4H < 1D.")
+    if confirmSeconds % chartSeconds != 0 or contextSeconds % chartSeconds != 0 or biasSeconds % chartSeconds != 0
+        runtime.error("Grafik TF tum secili TF'leri tam bolmeli. Varsayilan D / 4H / 45m icin 5m veya 15m kullanin.")
+    if internalLen >= swingLen
+        runtime.error("Internal pivot uzunlugu, swing pivot uzunlugundan kucuk olmali.")
+
+// Each written function call has independent state in each requested timeframe.
+// Direction follows confirmed structure breaks; HH/HL or LH/LL initializes an unknown state.
+f_structure(int length, float atr) =>
+    float ph = ta.pivothigh(high, length, length)
+    float pl = ta.pivotlow(low, length, length)
+    var float hi = na
+    var float lo = na
+    var float previousHi = na
+    var float previousLo = na
+    var int hiTime = na
+    var int loTime = na
+    var bool hiBroken = false
+    var bool loBroken = false
+    var bool hiSwept = false
+    var bool loSwept = false
+    var int bias = 0
+    int priorBias = bias
+    int structureEvent = 0
+    int sweepSide = 0
+    float sweptLevel = na
+    float sweepExtreme = na
+    float oppositeLevel = na
+    bool ordered = false
+    // Evaluate against levels already known BEFORE this candle's pivot updates.
+    bool upBreak = not na(hi) and not hiBroken and close > hi + breakBuffer * atr
+    bool downBreak = not na(lo) and not loBroken and close < lo - breakBuffer * atr
+    bool ssl = not na(lo) and not loBroken and not loSwept and low < lo - sweepBuffer * atr and close > lo
+    bool bsl = not na(hi) and not hiBroken and not hiSwept and high > hi + sweepBuffer * atr and close < hi
+    if ssl
+        loSwept := true
+    if bsl
+        hiSwept := true
+    if ssl and not bsl
+        sweepSide := 1
+        sweptLevel := lo
+        sweepExtreme := low
+        oppositeLevel := hi
+        ordered := not na(hiTime) and not na(loTime) and loTime < hiTime and hiTime < time
+    if bsl and not ssl
+        sweepSide := -1
+        sweptLevel := hi
+        sweepExtreme := high
+        oppositeLevel := lo
+        ordered := not na(hiTime) and not na(loTime) and hiTime < loTime and loTime < time
+    if upBreak
+        hiBroken := true
+    if downBreak
+        loBroken := true
+    if upBreak and not downBreak
+        structureEvent := priorBias == -1 ? 2 : priorBias == 1 ? 1 : 3
+        bias := 1
+    if downBreak and not upBreak
+        structureEvent := priorBias == 1 ? -2 : priorBias == -1 ? -1 : -3
+        bias := -1
+    if upBreak and downBreak
+        bias := 0
+    if not na(ph)
+        previousHi := hi
+        hi := ph
+        hiTime := time[length]
+        hiBroken := false
+        hiSwept := false
+    if not na(pl)
+        previousLo := lo
+        lo := pl
+        loTime := time[length]
+        loBroken := false
+        loSwept := false
+    if bias == 0 and not na(previousHi) and not na(previousLo)
+        bias := hi > previousHi and lo > previousLo ? 1 : hi < previousHi and lo < previousLo ? -1 : 0
+    [bias, hi, lo, hiBroken, loBroken, structureEvent, sweepSide, sweptLevel, sweepExtreme, oppositeLevel, priorBias, ordered]
+
+f_context() =>
+    float atr = ta.atr(14)
+    [sb, sh, sl, shb, slb, se, ss, sr, sx, so, sp, sq] = f_structure(swingLen, atr)
+    [ib, ih, il, ihb, ilb, ie, iss, ir, ix, io, ip, iq] = f_structure(internalLen, atr)
+    float path = math.sum(math.abs(ta.change(close)), regimeLen)
+    float efficiency = path > 0 ? math.abs(close - close[regimeLen]) / path : 0.0
+    float width = ta.highest(high, regimeLen) - ta.lowest(low, regimeLen)
+    bool compressed = not na(atr) and efficiency <= efficiencyMax and width <= compressionMax * atr
+    // Only confirmed requested candles. Includes source open AND close timestamps.
+    [time[1], time_close[1], open[1], high[1], low[1], close[1], close[2], atr[1], sb[1], ib[1], sh[1], sl[1], shb[1], slb[1], ih[1], il[1], se[1], ie[1], ss[1], sr[1], sx[1], iss[1], ir[1], ix[1], io[1], ip[1], iq[1], compressed[1]]
+
+[dTime, dEnd, dOpen, dHigh, dLow, dClose, dPreviousClose, dAtr, dSwing, dInternal, dSwingHigh, dSwingLow, dHighBroken, dLowBroken, dInternalHigh, dInternalLow, dSwingEvent, dInternalEvent, dSweep, dSweptLevel, dExtreme, dISweep, dIRef, dIX, dIOpposite, dIPrior, dIOrdered, dCompressed] = request.security(syminfo.tickerid, biasTf, f_context(), lookahead = barmerge.lookahead_on)
+[hTime, hEnd, hOpen, hHigh, hLow, hClose, hPreviousClose, hAtr, hSwing, hInternal, hSwingHigh, hSwingLow, hHighBroken, hLowBroken, hInternalHigh, hInternalLow, hSwingEvent, hInternalEvent, hSweep, hSweptLevel, hExtreme, hISweep, hIRef, hIX, hIOpposite, hIPrior, hIOrdered, hCompressed] = request.security(syminfo.tickerid, contextTf, f_context(), lookahead = barmerge.lookahead_on)
+[cTime, cEnd, cOpen, cHigh, cLow, cClose, cPreviousClose, cAtr, cSwing, cInternal, cSwingHigh, cSwingLow, cHighBroken, cLowBroken, cInternalHigh, cInternalLow, cSwingEvent, cInternalEvent, cSweep, cSweptLevel, cExtreme, cISweep, cIRef, cIX, cIOpposite, cIPrior, cIOrdered, cCompressed] = request.security(syminfo.tickerid, confirmTf, f_context(), lookahead = barmerge.lookahead_on)
+
+bool newD = not na(dTime) and (na(dTime[1]) or dTime != dTime[1])
+bool newH = not na(hTime) and (na(hTime[1]) or hTime != hTime[1])
+bool newC = not na(cTime) and (na(cTime[1]) or cTime != cTime[1])
+bool dataReady = not na(dAtr) and not na(hAtr) and not na(cAtr) and not na(hSwingHigh) and not na(hSwingLow)
+
+// Market regime, structural phase and sweep event are separate facts.
+bool aligned = dSwing != 0 and hSwing == dSwing and cSwing == dSwing
+bool pullback = dSwing != 0 and hSwing == dSwing and (hInternal == -dSwing or cSwing == -dSwing or cInternal == -dSwing)
+bool reversalCandidate = dSwing != 0 and hSwing == -dSwing
+string regimeText = not dataReady ? "Veri bekleniyor" : hCompressed ? "Sikisma adayi" : aligned and not pullback ? "Trend uyumu" : reversalCandidate ? "HTF celiskisi / donus adayi" : pullback ? "Ana trendde duzeltme" : "Karisik"
+
+// Phase: 0 idle, 1 wait for break, 2 wait for retest, 3 first-visit reaction,
+// 4 entry-ready, 5 invalid, 6 expired. A terminal phase is NOT an open position.
+type Setup
+    int side = 0
+    int phase = 0
+    string model = ""
+    string id = ""
+    string reason = "Aday yok"
+    int sweepStart = na
+    int sweepEnd = na
+    int createdBar = na
+    int breakEnd = na
+    int breakBar = na
+    int touchBar = na
+    int terminalBar = na
+    float criticalLevel = na
+    float sweptLevel = na
+    float extreme = na
+    float breakLevel = na
+    float stop = na
+    float bandLow = na
+    float bandHigh = na
+    float confirmAtr = na
+    float target = na
+    float entry = na
+    float rr = na
+    box area = na
+
+var array<Setup> setups = array.from(Setup.new(side = 1), Setup.new(side = -1))
+
+f_bias(int bias) =>
+    bias == 1 ? "Bullish" : bias == -1 ? "Bearish" : "Belirsiz"
+
+f_phase(int phase) =>
+    switch phase
+        1 => "SWEEP / ChoCh bekleniyor"
+        2 => "CHOCH / ilk retest bekleniyor"
+        3 => "TEMAS / tepki bekleniyor"
+        4 => "HAZIR"
+        5 => "IPTAL"
+        6 => "SURE DOLDU"
+        => "Aday yok"
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+f_event_text(Setup s, string eventName) =>
+    "MPA PB v0.1 | " + eventName + " | " + syminfo.tickerid + " | " + s.model + (s.side == 1 ? " LONG" : " SHORT") + " | id=" + s.id + " | TF=" + biasTf + "/" + contextTf + "/" + confirmTf + "/" + timeframe.period + " | " + s.reason + " | sweep=" + f_price(s.sweptLevel) + " | kirilim=" + f_price(s.breakLevel) + " | stop=" + f_price(s.stop) + " | hedef=" + f_price(s.target) + " | aday giris=" + f_price(s.entry) + " | RR=" + (na(s.rr) ? "-" : str.tostring(s.rr, "#.##"))
+
+f_notice(Setup s, string eventName, bool terminal) =>
+    string output = ""
+    bool enabled = eventName == "HAZIR" or notifyMode == "Tum asamalar" or (terminal and notifyMode == "Hazir + iptal")
+    if enabled
+        output := f_event_text(s, eventName) + "\n"
+    if showLabels
+        color ink = terminal ? color.gray : s.side == 1 ? color.teal : color.orange
+        label.new(bar_index, s.side == 1 ? low : high, s.model + " " + eventName, style = s.side == 1 ? label.style_label_up : label.style_label_down, color = color.new(ink, 20), textcolor = color.white, size = size.tiny)
+    output
+
+method finish(Setup s, int phase, string reason) =>
+    s.phase := phase
+    s.reason := reason
+    s.terminalBar := bar_index
+    if not na(s.area)
+        box.set_extend(s.area, extend.none)
+        box.set_right(s.area, time_close)
+
+method start(Setup s, string model, int sourceStart, int sourceEnd, float critical, float swept, float extreme, float threshold, float atr) =>
+    s.phase := 1
+    s.model := model
+    s.id := syminfo.tickerid + ":" + model + ":" + str.tostring(sourceEnd) + ":" + str.tostring(s.side)
+    s.reason := "Sweep teyitli; sonraki onay mumunda yapi kirilimi bekleniyor"
+    s.sweepStart := sourceStart
+    s.sweepEnd := sourceEnd
+    s.createdBar := bar_index
+    s.breakEnd := na
+    s.breakBar := na
+    s.touchBar := na
+    s.criticalLevel := critical
+    s.sweptLevel := swept
+    s.extreme := extreme
+    s.breakLevel := threshold
+    s.stop := extreme - s.side * math.max(stopBuffer * atr, syminfo.mintick)
+    s.bandLow := na
+    s.bandHigh := na
+    s.confirmAtr := na
+    s.target := na
+    s.entry := na
+    s.rr := na
+    s.area := na
+
+// Nearest eligible automatic HTF reference: HTF swing, macro swing, prior macro candle H/L.
+f_critical(int side, float reference) =>
+    float a = side == 1 ? (not hLowBroken ? hSwingLow : na) : (not hHighBroken ? hSwingHigh : na)
+    float b = side == 1 ? (not dLowBroken ? dSwingLow : na) : (not dHighBroken ? dSwingHigh : na)
+    float c = side == 1 ? dLow : dHigh
+    float chosen = na
+    float distance = levelNearAtr * hAtr
+    array<float> levels = array.from(a, b, c)
+    for value in levels
+        if not na(value) and math.abs(reference - value) <= distance
+            chosen := value
+            distance := math.abs(reference - value)
+    chosen
+
+// Freeze target at ChoCh confirmation; no invented fixed-R target to pass the RR filter.
+f_target(int side, float fromPrice) =>
+    float chosen = na
+    array<float> levels = side == 1 ? array.from(not hHighBroken ? hSwingHigh : na, not dHighBroken ? dSwingHigh : na, dHigh) : array.from(not hLowBroken ? hSwingLow : na, not dLowBroken ? dSwingLow : na, dLow)
+    for value in levels
+        if not na(value) and side * (value - fromPrice) > syminfo.mintick
+            if na(chosen) or side * (value - chosen) < 0
+                chosen := value
+    chosen
+
+float longCritical = f_critical(1, cIRef)
+float shortCritical = f_critical(-1, cIRef)
+bool candidate4Long = use4A and newC and cISweep == 1 and cIOrdered and cIPrior == -1 and not na(longCritical) and cClose < cIOpposite
+bool candidate4Short = use4A and newC and cISweep == -1 and cIOrdered and cIPrior == 1 and not na(shortCritical) and cClose > cIOpposite
+bool candidate5Long = use5A and newH and hSweep == 1 and cInternal == -1 and not na(cInternalHigh) and cClose < cInternalHigh
+bool candidate5Short = use5A and newH and hSweep == -1 and cInternal == 1 and not na(cInternalLow) and cClose > cInternalLow
+bool conflictingCandidates = (candidate4Long or candidate5Long) and (candidate4Short or candidate5Short)
+
+bool readyLong = false
+bool readyShort = false
+bool cancelled = false
+bool expired = false
+string messages = ""
+if barstate.isconfirmed and dataReady
+    for index = 0 to array.size(setups) - 1
+        Setup s = array.get(setups, index)
+        bool active = s.phase >= 1 and s.phase <= 3
+        if active and bar_index > s.createdBar
+            // Conservative precedence: invalidation / elapsed time / target already hit,
+            // then confirmation. Intrabar ordering is never inferred from one OHLC candle.
+            bool invalidExtreme = s.side == 1 ? low < s.extreme : high > s.extreme
+            bool invalidContext = newH and hTime >= s.sweepEnd and (s.side == 1 ? hClose < s.criticalLevel : hClose > s.criticalLevel)
+            bool invalidBias = biasPolicy == "Yalniz ana bias yonu" and dSwing != s.side
+            int deadline = s.phase == 1 ? s.sweepEnd + int(confirmWait * confirmSeconds * 1000) : s.breakEnd + int(retestWait * confirmSeconds * 1000)
+            // A source candle ending exactly at the deadline is still an on-time event,
+            // even though its confirmed packet is observed on the next chart candle.
+            bool onTimeConfirmation = s.phase == 1 and newC and cTime >= s.sweepEnd and cEnd <= deadline
+            bool timedOut = time_close > deadline and not onTimeConfirmation
+            bool targetReached = s.phase >= 2 and not na(s.target) and (s.side == 1 ? high >= s.target : low <= s.target)
+            if invalidExtreme or invalidContext or invalidBias
+                s.finish(5, invalidExtreme ? "Sweep ucu yeniden ihlal edildi" : invalidContext ? "HTF kritik seviyenin gecersiz tarafinda kapandi" : "Ana bias filtresi bozuldu")
+                messages += f_notice(s, "IPTAL", true)
+                cancelled := true
+            else if timedOut
+                s.finish(6, s.phase == 1 ? "ChoCh bekleme suresi doldu" : "Retest bekleme suresi doldu")
+                messages += f_notice(s, "SURE DOLDU", true)
+                expired := true
+            else if targetReached
+                s.finish(5, "Ilk giris onayindan once hedefe ulasildi")
+                messages += f_notice(s, "IPTAL", true)
+                cancelled := true
+            else
+                if s.phase == 1 and newC and cTime >= s.sweepEnd
+                    float candleRange = math.max(cHigh - cLow, syminfo.mintick)
+                    bool displaced = math.abs(cClose - cOpen) / candleRange >= displacementBody and candleRange >= displacementRange * cAtr
+                    bool crossed = s.side == 1 ? cPreviousClose <= s.breakLevel and cClose > s.breakLevel : cPreviousClose >= s.breakLevel and cClose < s.breakLevel
+                    bool directional = s.side * (cClose - cOpen) > 0
+                    bool away = s.side * (cClose - s.breakLevel) >= displacementClose * cAtr
+                    if crossed
+                        if displaced and directional and away
+                            s.phase := 2
+                            s.breakEnd := cEnd
+                            s.breakBar := bar_index
+                            s.confirmAtr := cAtr
+                            s.bandLow := s.breakLevel - retestHalfWidth * cAtr
+                            s.bandHigh := s.breakLevel + retestHalfWidth * cAtr
+                            s.target := f_target(s.side, cClose)
+                            s.reason := "Govdeli kirilim teyitli; ilk retest bekleniyor"
+                            if na(s.target)
+                                s.finish(5, "Kirilim otesinde uygun yapisal hedef yok")
+                                messages += f_notice(s, "IPTAL", true)
+                                cancelled := true
+                            else
+                                if showSetup
+                                    color ink = s.side == 1 ? color.teal : color.orange
+                                    s.area := box.new(left = time, top = s.bandHigh, right = time_close, bottom = s.bandLow, xloc = xloc.bar_time, extend = extend.right, border_color = ink, bgcolor = color.new(ink, 88), text = s.model + " retest", text_size = size.tiny, text_color = ink)
+                                messages += f_notice(s, "CHOCH", false)
+                        else
+                            s.finish(5, "Ilk esik kirilimi displacement kosullarini karsilamadi")
+                            messages += f_notice(s, "IPTAL", true)
+                            cancelled := true
+                // A newly imported break was known at this chart candle's OPEN. The first
+                // post-break chart candle can be a valid retest; source timestamps decide.
+                bool targetHitAfterImport = s.phase == 2 and not na(s.target) and (s.side == 1 ? high >= s.target : low <= s.target)
+                if targetHitAfterImport
+                    s.finish(5, "Kirilim bildirimi islenirken hedefe zaten ulasildi")
+                    messages += f_notice(s, "IPTAL", true)
+                    cancelled := true
+                if s.phase == 2 and time >= s.breakEnd
+                    bool touched = high >= s.bandLow and low <= s.bandHigh
+                    bool tooFar = s.side == 1 ? close > s.bandHigh + maximumChase * s.confirmAtr : close < s.bandLow - maximumChase * s.confirmAtr
+                    if touched
+                        s.phase := 3
+                        s.touchBar := bar_index
+                        s.reason := "Ilk retest temasi; grafik mumunda tepki bekleniyor"
+                        messages += f_notice(s, "RETEST", false)
+                    else if tooFar
+                        // Distance alone before a pullback is not an invalidation.
+                        s.reason := "Fiyat banttan uzakta; geri donus bekleniyor"
+                if s.phase == 3
+                    bool held = s.side == 1 ? close > s.breakLevel : close < s.breakLevel
+                    bool reaction = not requireCandleDirection or s.side * (close - open) > 0
+                    bool chase = s.side == 1 ? close > s.bandHigh + maximumChase * s.confirmAtr : close < s.bandLow - maximumChase * s.confirmAtr
+                    bool lostBand = s.side == 1 ? close < s.bandLow : close > s.bandHigh
+                    bool reactionExpired = bar_index - s.touchBar >= reactionBars
+                    if lostBand or chase or reactionExpired
+                        bool onlyExpired = reactionExpired and not lostBand and not chase
+                        s.finish(onlyExpired ? 6 : 5, lostBand ? "Ilk retest bandi kapanisla kaybedildi" : chase ? "Tepki kapanisi giris bandindan fazla uzaklasti" : "Ilk temas sonrasi tepki gelmedi")
+                        messages += f_notice(s, onlyExpired ? "SURE DOLDU" : "IPTAL", true)
+                        cancelled := cancelled or not onlyExpired
+                        expired := expired or onlyExpired
+                    else if held and reaction
+                        s.entry := close
+                        float riskDistance = s.side * (s.entry - s.stop)
+                        float rewardDistance = s.side * (s.target - s.entry)
+                        s.rr := riskDistance > 0 ? rewardDistance / riskDistance : na
+                        if not na(s.rr) and s.rr >= minimumRR
+                            s.finish(4, "Ilk retest tepkisi ve planlanan RR uygun; manuel degerlendirme")
+                            messages += f_notice(s, "HAZIR", false)
+                            readyLong := readyLong or s.side == 1
+                            readyShort := readyShort or s.side == -1
+                        else
+                            s.finish(5, "Ilk retestte planlanan RR yetersiz")
+                            messages += f_notice(s, "IPTAL", true)
+                            cancelled := true
+
+        // One active candidate per direction. Existing candidates retain their frozen levels.
+        bool available = (s.phase == 0 or s.phase >= 4) and (na(s.terminalBar) or bar_index - s.terminalBar >= cooldownBars)
+        bool allowedSide = s.side == 1 ? directionInput != "Short" : directionInput != "Long"
+        bool allowedBias = biasPolicy == "Ters yone izin ver" or dSwing == s.side
+        if available and allowedSide and allowedBias and not conflictingCandidates
+            bool route5 = s.side == 1 ? candidate5Long : candidate5Short
+            bool route4 = s.side == 1 ? candidate4Long : candidate4Short
+            if route5
+                float threshold = s.side == 1 ? cInternalHigh : cInternalLow
+                bool survived = s.side == 1 ? low >= hExtreme : high <= hExtreme
+                if survived
+                    s.start("5A", hTime, hEnd, hSweptLevel, hSweptLevel, hExtreme, threshold, hAtr)
+                    messages += f_notice(s, "SWEEP", false)
+            else if route4
+                bool survived = s.side == 1 ? low >= cIX : high <= cIX
+                if survived
+                    s.start("4A", cTime, cEnd, s.side == 1 ? longCritical : shortCritical, cIRef, cIX, cIOpposite, cAtr)
+                    messages += f_notice(s, "SWEEP", false)
+    if notifyBias and newD and not na(dSwing[1]) and dSwing != dSwing[1]
+        messages += "MPA PB v0.1 | ANA BIAS | " + syminfo.tickerid + " | " + biasTf + " " + f_bias(dSwing) + "\n"
+    if str.length(messages) > 0
+        // Aggregate same-bar events so once_per_bar_close cannot discard a second event.
+        alert(messages, alert.freq_once_per_bar_close)
+
+Setup longSetup = array.get(setups, 0)
+Setup shortSetup = array.get(setups, 1)
+bool longActive = longSetup.phase >= 1 and longSetup.phase <= 3
+bool shortActive = shortSetup.phase >= 1 and shortSetup.phase <= 3
+plot(showLevels ? hSwingHigh : na, "HTF swing high", color.new(color.red, 35), style = plot.style_stepline)
+plot(showLevels ? hSwingLow : na, "HTF swing low", color.new(color.green, 35), style = plot.style_stepline)
+plot(showSetup and longActive ? longSetup.breakLevel : na, "Long kirilim esigi", color.teal, style = plot.style_linebr)
+plot(showSetup and shortActive ? shortSetup.breakLevel : na, "Short kirilim esigi", color.orange, style = plot.style_linebr)
+plot(showSetup and longActive ? longSetup.stop : na, "Long yapisal stop", color.new(color.red, 20), style = plot.style_linebr)
+plot(showSetup and shortActive ? shortSetup.stop : na, "Short yapisal stop", color.new(color.red, 20), style = plot.style_linebr)
+plot(showSetup and longActive ? longSetup.target : na, "Long yapisal hedef", color.new(color.green, 20), style = plot.style_linebr)
+plot(showSetup and shortActive ? shortSetup.target : na, "Short yapisal hedef", color.new(color.green, 20), style = plot.style_linebr)
+plotshape(readyLong, title = "4A/5A Long hazir", style = shape.triangleup, location = location.belowbar, color = color.lime, text = "HAZIR", textcolor = color.white, size = size.small)
+plotshape(readyShort, title = "4A/5A Short hazir", style = shape.triangledown, location = location.abovebar, color = color.red, text = "HAZIR", textcolor = color.white, size = size.small)
+bgcolor(showBackground ? color.new(hCompressed ? color.gray : pullback ? color.orange : aligned ? color.teal : color.gray, 94) : na)
+alertcondition(readyLong, "4A/5A Long hazir", "MPA Playbook LONG HAZIR | {{exchange}}:{{ticker}} | {{interval}} | close={{close}}")
+alertcondition(readyShort, "4A/5A Short hazir", "MPA Playbook SHORT HAZIR | {{exchange}}:{{ticker}} | {{interval}} | close={{close}}")
+alertcondition(cancelled, "Setup iptal", "MPA Playbook setup iptal | {{exchange}}:{{ticker}} | {{interval}}")
+alertcondition(expired, "Setup suresi doldu", "MPA Playbook setup suresi doldu | {{exchange}}:{{ticker}} | {{interval}}")
+
+f_cell(table panel, int column, int row, string value, color ink) =>
+    table.cell(panel, column, row, value, text_color = ink, bgcolor = color.new(color.black, 12), text_size = size.small)
+
+var table dashboard = table.new(position.top_left, 3, 12, border_width = 1)
+if barstate.islast
+    f_cell(dashboard, 0, 0, "MPA Playbook v0.1", color.white)
+    f_cell(dashboard, 1, 0, "Swing", color.white)
+    f_cell(dashboard, 2, 0, "Internal", color.white)
+    f_cell(dashboard, 0, 1, biasTf, color.white)
+    f_cell(dashboard, 1, 1, f_bias(dSwing), color.white)
+    f_cell(dashboard, 2, 1, f_bias(dInternal), color.white)
+    f_cell(dashboard, 0, 2, contextTf, color.white)
+    f_cell(dashboard, 1, 2, f_bias(hSwing), color.white)
+    f_cell(dashboard, 2, 2, f_bias(hInternal), color.white)
+    f_cell(dashboard, 0, 3, confirmTf, color.white)
+    f_cell(dashboard, 1, 3, f_bias(cSwing), color.white)
+    f_cell(dashboard, 2, 3, f_bias(cInternal), color.white)
+    f_cell(dashboard, 0, 4, "Piyasa / faz", color.white)
+    f_cell(dashboard, 1, 4, regimeText, color.yellow)
+    f_cell(dashboard, 2, 4, "Reversal: " + biasPolicy, color.white)
+    f_cell(dashboard, 0, 5, "Long " + longSetup.model, color.teal)
+    f_cell(dashboard, 1, 5, f_phase(longSetup.phase), color.teal)
+    f_cell(dashboard, 2, 5, longSetup.reason, color.white)
+    f_cell(dashboard, 0, 6, "Short " + shortSetup.model, color.orange)
+    f_cell(dashboard, 1, 6, f_phase(shortSetup.phase), color.orange)
+    f_cell(dashboard, 2, 6, shortSetup.reason, color.white)
+    f_cell(dashboard, 0, 7, "Kirilim / stop", color.white)
+    f_cell(dashboard, 1, 7, f_price(longSetup.breakLevel) + " / " + f_price(longSetup.stop), color.teal)
+    f_cell(dashboard, 2, 7, f_price(shortSetup.breakLevel) + " / " + f_price(shortSetup.stop), color.orange)
+    f_cell(dashboard, 0, 8, "Hedef / RR", color.white)
+    f_cell(dashboard, 1, 8, f_price(longSetup.target) + " / " + (na(longSetup.rr) ? "-" : str.tostring(longSetup.rr, "#.##")), color.teal)
+    f_cell(dashboard, 2, 8, f_price(shortSetup.target) + " / " + (na(shortSetup.rr) ? "-" : str.tostring(shortSetup.rr, "#.##")), color.orange)
+    f_cell(dashboard, 0, 9, "Bildirim", color.white)
+    f_cell(dashboard, 1, 9, notifyMode, color.white)
+    f_cell(dashboard, 2, 9, conflictingCandidates ? "Yeni aday yonleri celiskili" : "Her yonde tek aday", color.white)
+    f_cell(dashboard, 0, 10, "Son onayli HTF", color.white)
+    f_cell(dashboard, 1, 10, na(hEnd) ? "-" : str.format_time(hEnd, "MM-dd HH:mm", syminfo.timezone), color.white)
+    f_cell(dashboard, 2, 10, syminfo.timezone, color.white)
+    f_cell(dashboard, 0, 11, "HAZIR = aday", color.yellow)
+    f_cell(dashboard, 1, 11, "Gercek emir / dolum takibi yok", color.white)
+    f_cell(dashboard, 2, 11, "ATR / pivot tabanli kurallar", color.white)
