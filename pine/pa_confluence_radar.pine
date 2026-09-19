@@ -1,0 +1,299 @@
+//@version=6
+indicator("MPA | WO MO SR FVG OB Radar v0.1", overlay = true, max_boxes_count = 100, max_bars_back = 500)
+
+// Context alerts only. Exact implementation choices and limitations: alarm_plani.md.
+// Run on standard candles, e.g. 1H chart / 4H zones or 15m chart / 1H zones.
+string G_ZONE = "1. Otomatik bolgeler"
+string zoneTf = input.timeframe("240", "Bolge zaman dilimi", options = ["60", "240", "1D"], group = G_ZONE)
+int pivotLen = input.int(3, "Swing: sol / sag mum sayisi", minval = 2, maxval = 10, group = G_ZONE)
+int srHits = input.int(2, "SR icin gereken ayri swing sayisi", minval = 2, maxval = 5, group = G_ZONE)
+float srWidth = input.float(0.10, "SR yari genisligi / ATR", minval = 0.02, maxval = 0.5, step = 0.02, group = G_ZONE)
+float gapMin = input.float(0.20, "Minimum FVG / ATR", minval = 0.0, step = 0.05, group = G_ZONE)
+int obSearch = input.int(20, "OB: onceki ters mumu ara", minval = 1, maxval = 50, group = G_ZONE)
+float obMove = input.float(1.5, "OB disina minimum hareket / ATR", minval = 0.1, step = 0.1, group = G_ZONE)
+int maxAge = input.int(180, "Bolge omru: bolge TF mum sayisi", minval = 20, maxval = 450, group = G_ZONE)
+int maxZones = input.int(60, "En fazla aktif bolge", minval = 10, maxval = 80, group = G_ZONE)
+
+string G_ALERT = "2. Kesisim ve alarm"
+bool useWo = input.bool(true, "Weekly Open", group = G_ALERT)
+bool useMo = input.bool(true, "Monthly Open", group = G_ALERT)
+float proximity = input.float(0.25, "Acilis-bolge yakinligi / bolge ATR", minval = 0.0, maxval = 1.0, step = 0.05, group = G_ALERT)
+int minimumGroups = input.int(3, "Minimum grup: Acilis, SR, FVG, OB", minval = 2, maxval = 4, group = G_ALERT)
+bool freshOnly = input.bool(true, "FVG / OB sadece ilk temas", group = G_ALERT)
+bool filterTrend = input.bool(true, "Net HTF trendine ters alarmlari filtrele", group = G_ALERT)
+string sideInput = input.string("Iki yon", "Izlenecek yon", options = ["Iki yon", "Long bolgesi", "Short bolgesi"], group = G_ALERT)
+int cooldown = input.int(12, "Ayni yon icin bekleme: grafik mum sayisi", minval = 1, group = G_ALERT)
+
+string G_RANGE = "3. Otomatik range adayi"
+int rangeMinBars = input.int(20, "Iki sinirin minimum yasi: bolge TF mumlari", minval = 5, group = G_RANGE)
+float rangeMaxAtr = input.float(6.0, "Maksimum range genisligi / ATR", minval = 1.0, step = 0.5, group = G_RANGE)
+bool muteEq = input.bool(true, "Range orta %20 bandinda alarmi sustur", group = G_RANGE)
+bool showZones = input.bool(true, "SR / FVG / OB kutularini goster", group = G_RANGE)
+bool showRange = input.bool(true, "Range adayini goster", group = G_RANGE)
+
+if barstate.isfirst and (not chart.is_standard or timeframe.in_seconds() >= timeframe.in_seconds(zoneTf))
+    runtime.error("Standart mum kullanin. Grafik TF, bolge TF'den kucuk olmali. Ornek: 1H grafik + 4H bolge.")
+
+// A zone becomes usable only after its formation / pivot confirmation is available.
+// kind: 1 = SR, 2 = FVG, 3 = OB. side: +1 = support/bullish, -1 = resistance/bearish.
+type Zone
+    float lo
+    float hi
+    int side
+    int kind
+    int hits
+    int createdBar
+    bool tapped
+    box drawing
+
+var array<Zone> zones = array.new<Zone>()
+
+f_color(int kind, int side) =>
+    kind == 1 ? color.blue : kind == 2 ? (side == 1 ? color.teal : color.orange) : (side == 1 ? color.green : color.red)
+
+f_name(int kind, int side, int hits) =>
+    string family = kind == 1 ? "SR " + str.tostring(hits) : kind == 2 ? "FVG" : "OB"
+    family + (side == 1 ? " +" : " -")
+
+f_delete(int index) =>
+    Zone z = array.remove(zones, index)
+    if not na(z.drawing)
+        box.delete(z.drawing)
+
+f_add(float lo, float hi, int side, int kind, int serial, int knownTime) =>
+    // Several structure breaks can point to the same still-active OB candle.
+    bool duplicate = false
+    if kind == 3 and array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            Zone existing = array.get(zones, i)
+            if existing.kind == kind and existing.side == side and existing.lo == lo and existing.hi == hi
+                duplicate := true
+    if not duplicate and not na(lo) and not na(hi) and hi > lo
+        if array.size(zones) >= maxZones
+            f_delete(0)
+        color ink = f_color(kind, side)
+        box drawing = na
+        if showZones
+            drawing := box.new(left = knownTime, top = hi, right = time_close, bottom = lo, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(ink, 45), bgcolor = color.new(ink, 91), text = f_name(kind, side, 1), text_size = size.tiny, text_color = ink)
+        array.push(zones, Zone.new(lo, hi, side, kind, 1, serial, false, drawing))
+
+// Distinct confirmed pivots are clustered. Candle-by-candle contact is not a new SR hit.
+f_add_sr(float price, int side, float atr, int serial, int knownTime) =>
+    if not na(price) and not na(atr)
+        int match = -1
+        float best = srWidth * atr * 2.0
+        if array.size(zones) > 0
+            for i = 0 to array.size(zones) - 1
+                Zone z = array.get(zones, i)
+                float distance = math.abs(price - (z.lo + z.hi) * 0.5)
+                if z.kind == 1 and z.side == side and distance <= best
+                    best := distance
+                    match := i
+        if match >= 0
+            Zone z = array.get(zones, match)
+            float center = (((z.lo + z.hi) * 0.5) * z.hits + price) / (z.hits + 1)
+            z.hits := z.hits + 1
+            z.lo := center - srWidth * atr
+            z.hi := center + srWidth * atr
+            if not na(z.drawing)
+                box.set_top(z.drawing, z.hi)
+                box.set_bottom(z.drawing, z.lo)
+                box.set_text(z.drawing, f_name(z.kind, z.side, z.hits))
+        else
+            f_add(price - srWidth * atr, price + srWidth * atr, side, 1, serial, knownTime)
+
+// This entire detector runs in the requested zone timeframe.
+f_htf() =>
+    float atr = ta.atr(14)
+    float ph = ta.pivothigh(high, pivotLen, pivotLen)
+    float pl = ta.pivotlow(low, pivotLen, pivotLen)
+    var float lastH = na
+    var float prevH = na
+    var float lastL = na
+    var float prevL = na
+    var bool brokenH = false
+    var bool brokenL = false
+    if not na(ph)
+        prevH := lastH
+        lastH := ph
+        brokenH := false
+    if not na(pl)
+        prevL := lastL
+        lastL := pl
+        brokenL := false
+    int bias = not na(prevH) and not na(prevL) ? (lastH > prevH and lastL > prevL ? 1 : lastH < prevH and lastL < prevL ? -1 : 0) : 0
+    float bodyRatio = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+    float middleRatio = math.abs(close[1] - open[1]) / math.max(high[1] - low[1], syminfo.mintick)
+    bool strong = bodyRatio >= 0.65 and high - low >= 0.8 * atr
+    bool bullGap = low > high[2] and low - high[2] >= gapMin * atr and middleRatio >= 0.5
+    bool bearGap = high < low[2] and low[2] - high >= gapMin * atr and middleRatio >= 0.5
+    float gapLo = bullGap ? high[2] : bearGap ? high : na
+    float gapHi = bullGap ? low : bearGap ? low[2] : na
+    int gapSide = bullGap ? 1 : bearGap ? -1 : 0
+    float obLo = na
+    float obHi = na
+    int obSide = 0
+    // Consume the first close beyond a swing even when displacement is insufficient.
+    // This avoids treating a later continuation candle as a new structure break.
+    if not na(lastH) and not brokenH and close > lastH
+        brokenH := true
+        if strong and close > open and close - lastH >= 0.3 * atr
+            for j = 1 to obSearch
+                if close[j] < open[j]
+                    if close - high[j] >= obMove * atr
+                        obLo := low[j]
+                        obHi := high[j]
+                        obSide := 1
+                    break
+    if not na(lastL) and not brokenL and close < lastL
+        brokenL := true
+        if strong and close < open and lastL - close >= 0.3 * atr
+            for j = 1 to obSearch
+                if close[j] > open[j]
+                    if low[j] - close >= obMove * atr
+                        obLo := low[j]
+                        obHi := high[j]
+                        obSide := -1
+                    break
+    // Shift every developing HTF value. lookahead_on is safe with these offsets.
+    [time[1], time_close[1], bar_index[1], close[1], atr[1], ph[1], pl[1], gapLo[1], gapHi[1], gapSide[1], obLo[1], obHi[1], obSide[1], bias[1]]
+
+[htfStamp, htfEnd, htfSerial, htfClose, htfAtr, pivotH, pivotL, gapLo, gapHi, gapSide, obLo, obHi, obSide, htfBias] = request.security(syminfo.tickerid, zoneTf, f_htf(), lookahead = barmerge.lookahead_on)
+// Current period OPEN is already known at period start; never substitute high/low/close here.
+float wo = request.security(syminfo.tickerid, "1W", open, lookahead = barmerge.lookahead_on)
+float mo = request.security(syminfo.tickerid, "1M", open, lookahead = barmerge.lookahead_on)
+bool newHtf = not na(htfStamp) and (na(htfStamp[1]) or htfStamp != htfStamp[1])
+
+if barstate.isconfirmed and newHtf and not na(htfAtr)
+    // Retire broken zones. Automatic SR flips / IFVG conversion are outside v0.1.
+    if array.size(zones) > 0
+        for i = array.size(zones) - 1 to 0
+            Zone z = array.get(zones, i)
+            bool broken = z.side == 1 ? htfClose < z.lo : htfClose > z.hi
+            if broken or htfSerial - z.createdBar > maxAge
+                f_delete(i)
+    f_add_sr(pivotH, -1, htfAtr, htfSerial, htfEnd)
+    f_add_sr(pivotL, 1, htfAtr, htfSerial, htfEnd)
+    if gapSide != 0
+        f_add(gapLo, gapHi, gapSide, 2, htfSerial, htfEnd)
+    if obSide != 0
+        f_add(obLo, obHi, obSide, 3, htfSerial, htfEnd)
+
+// Range candidate = nearest qualified support and resistance enclosing HTF close.
+// This is an explicit heuristic, not an assertion that every enclosed price is ranging.
+float rangeLo = na
+float rangeHi = na
+int supportBorn = na
+int resistanceBorn = na
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        Zone z = array.get(zones, i)
+        float center = (z.lo + z.hi) * 0.5
+        if z.kind == 1 and z.hits >= srHits
+            if z.side == 1 and center < htfClose and (na(rangeLo) or center > rangeLo)
+                rangeLo := center
+                supportBorn := z.createdBar
+            if z.side == -1 and center > htfClose and (na(rangeHi) or center < rangeHi)
+                rangeHi := center
+                resistanceBorn := z.createdBar
+bool rangeValid = not na(rangeLo) and not na(rangeHi) and rangeHi > rangeLo and rangeHi - rangeLo <= rangeMaxAtr * htfAtr and htfSerial - math.max(supportBorn, resistanceBorn) >= rangeMinBars
+float rangeEq = rangeValid ? (rangeHi + rangeLo) * 0.5 : na
+bool inEq = rangeValid and math.abs(close - rangeEq) <= (rangeHi - rangeLo) * 0.10
+
+// Count concept families once. WO + MO still counts as ONE opening family.
+// Every participating zone must be close to the SAME anchor price, in the SAME direction.
+f_check(float anchor, int side, float tolerance) =>
+    bool sr = false
+    bool fvg = false
+    bool ob = false
+    bool actualTouch = false
+    if not na(anchor) and not na(tolerance) and array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            Zone z = array.get(zones, i)
+            bool nearAnchor = z.hi >= anchor - tolerance and z.lo <= anchor + tolerance
+            bool eligible = z.side == side and nearAnchor and (z.kind == 1 ? z.hits >= srHits : not freshOnly or not z.tapped)
+            // A candle that closes through the far edge is not a supportive contact.
+            bool held = side == 1 ? close >= z.lo : close <= z.hi
+            if eligible and held
+                sr := sr or z.kind == 1
+                fvg := fvg or z.kind == 2
+                ob := ob or z.kind == 3
+                actualTouch := actualTouch or (high >= z.lo and low <= z.hi)
+    int score = 1 + (sr ? 1 : 0) + (fvg ? 1 : 0) + (ob ? 1 : 0)
+    bool touched = not na(anchor) and high >= anchor - tolerance and low <= anchor + tolerance and actualTouch
+    string reasons = (sr ? " + SR" : "") + (fvg ? " + FVG" : "") + (ob ? " + OB" : "")
+    [score, touched, reasons]
+
+float tolerance = proximity * htfAtr
+[wlScore, wlTouch, wlWhy] = f_check(useWo ? wo : na, 1, tolerance)
+[mlScore, mlTouch, mlWhy] = f_check(useMo ? mo : na, 1, tolerance)
+[wsScore, wsTouch, wsWhy] = f_check(useWo ? wo : na, -1, tolerance)
+[msScore, msTouch, msWhy] = f_check(useMo ? mo : na, -1, tolerance)
+bool wl = wlTouch and wlScore >= minimumGroups
+bool ml = mlTouch and mlScore >= minimumGroups
+bool ws = wsTouch and wsScore >= minimumGroups
+bool ms = msTouch and msScore >= minimumGroups
+bool allowLong = sideInput != "Short bolgesi" and (not filterTrend or htfBias != -1)
+bool allowShort = sideInput != "Long bolgesi" and (not filterTrend or htfBias != 1)
+bool contextAllowed = not (muteEq and inEq)
+bool longContext = (wl or ml) and allowLong and contextAllowed
+bool shortContext = (ws or ms) and allowShort and contextAllowed
+// If both directional contexts trigger together, suppress the ambiguous notification.
+bool ambiguous = longContext and shortContext
+bool longReady = longContext and not ambiguous
+bool shortReady = shortContext and not ambiguous
+var int lastLongAlert = na
+var int lastShortAlert = na
+bool fireLong = barstate.isconfirmed and longReady and not longReady[1] and (na(lastLongAlert) or bar_index - lastLongAlert >= cooldown)
+bool fireShort = barstate.isconfirmed and shortReady and not shortReady[1] and (na(lastShortAlert) or bar_index - lastShortAlert >= cooldown)
+string biasText = htfBias == 1 ? "HH/HL" : htfBias == -1 ? "LH/LL" : "Belirsiz / karisik"
+
+f_message(string side, string source, int score, float anchor, string bias) =>
+    "MPA v0.1 | WATCH " + side + " | " + syminfo.tickerid + " | Grafik " + timeframe.period + " / Bolge " + zoneTf + " | " + source + " | Grup " + str.tostring(score) + "/4 | Seviye " + str.tostring(anchor, format.mintick) + " | Yakinlik +/- " + str.tostring(tolerance, format.mintick) + " | Kapanis " + str.tostring(close, format.mintick) + " | HTF " + bias + " | Bolge temasi: giris onayi degil."
+
+if fireLong
+    bool pickWeekly = wl and (not ml or wlScore >= mlScore)
+    alert(f_message("LONG", pickWeekly ? "WO" + wlWhy : "MO" + mlWhy, pickWeekly ? wlScore : mlScore, pickWeekly ? wo : mo, biasText), alert.freq_once_per_bar_close)
+    lastLongAlert := bar_index
+if fireShort
+    bool pickWeekly = ws and (not ms or wsScore >= msScore)
+    alert(f_message("SHORT", pickWeekly ? "WO" + wsWhy : "MO" + msWhy, pickWeekly ? wsScore : msScore, pickWeekly ? wo : mo, biasText), alert.freq_once_per_bar_close)
+    lastShortAlert := bar_index
+
+// Update freshness AFTER all four anchor/direction checks, so iteration order is irrelevant.
+// Full wick fill retires an FVG; partial tap retires freshness, not the physical zone.
+if barstate.isconfirmed and array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        Zone z = array.get(zones, i)
+        if z.kind != 1 and high >= z.lo and low <= z.hi
+            z.tapped := true
+            bool fullFill = z.kind == 2 and (z.side == 1 ? low <= z.lo : high >= z.hi)
+            if fullFill
+                f_delete(i)
+            else if not na(z.drawing)
+                box.set_bgcolor(z.drawing, color.new(f_color(z.kind, z.side), 96))
+
+plot(useWo ? wo : na, "WO", color = color.yellow, style = plot.style_stepline)
+plot(useMo ? mo : na, "MO", color = color.fuchsia, style = plot.style_stepline)
+plot(showRange and rangeValid ? rangeHi : na, "Range adayi RH", color = color.new(color.red, 20), style = plot.style_linebr)
+plot(showRange and rangeValid ? rangeLo : na, "Range adayi RL", color = color.new(color.green, 20), style = plot.style_linebr)
+plot(showRange ? rangeEq : na, "Range adayi EQ", color = color.gray, style = plot.style_linebr)
+plotshape(fireLong, title = "Long bolge alarmi", style = shape.triangleup, location = location.belowbar, color = color.teal, size = size.small, text = "WATCH")
+plotshape(fireShort, title = "Short bolge alarmi", style = shape.triangledown, location = location.abovebar, color = color.orange, size = size.small, text = "WATCH")
+// Alternative to the dynamic alert() route; select only one route to avoid duplicate alerts.
+alertcondition(fireLong, "WATCH Long", "MPA WATCH LONG | {{exchange}}:{{ticker}} | {{interval}} | close={{close}}")
+alertcondition(fireShort, "WATCH Short", "MPA WATCH SHORT | {{exchange}}:{{ticker}} | {{interval}} | close={{close}}")
+
+var table panel = table.new(position.top_right, 2, 5, border_width = 1)
+if barstate.islast
+    color panelBg = color.new(color.black, 15)
+    table.cell(panel, 0, 0, "MPA Radar v0.1", text_color = color.white, bgcolor = panelBg)
+    table.cell(panel, 1, 0, "WATCH", text_color = color.yellow, bgcolor = panelBg)
+    table.cell(panel, 0, 1, "Bolge TF / HTF", text_color = color.white, bgcolor = panelBg)
+    table.cell(panel, 1, 1, zoneTf + " / " + biasText, text_color = color.white, bgcolor = panelBg)
+    table.cell(panel, 0, 2, "Aktif bolge", text_color = color.white, bgcolor = panelBg)
+    table.cell(panel, 1, 2, str.tostring(array.size(zones)), text_color = color.white, bgcolor = panelBg)
+    table.cell(panel, 0, 3, "Range adayi", text_color = color.white, bgcolor = panelBg)
+    table.cell(panel, 1, 3, rangeValid ? (inEq ? "EQ bandinda" : "Var") : "Yok", text_color = color.white, bgcolor = panelBg)
+    table.cell(panel, 0, 4, "Minimum grup", text_color = color.white, bgcolor = panelBg)
+    table.cell(panel, 1, 4, str.tostring(minimumGroups) + "/4" + (ambiguous ? " | Yon celiskisi" : ""), text_color = color.white, bgcolor = panelBg)
