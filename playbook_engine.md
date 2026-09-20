@@ -133,6 +133,6 @@ Varsayılan `Ters yone izin ver` seçimi, reversal modellerinin eski Daily bias 
 
 HTF verileri `request.security()` içinde bir mum ötelenmiş ifadeler ve `lookahead_on` ile alınır. Pivot teyidi sağdaki mumları bekler; panel ve alarmlar tamamlanmış kaynak mumlarına dayanır. İşaretler gerçek tespit mumunda yer alır, geçmiş pivot mumuna taşınmaz. [TradingView HTF veri ve repaint açıklaması](https://www.tradingview.com/pine-script-docs/concepts/other-timeframes-and-data/)
 
-## Sonraki geliştirme
+## Diğer playbook modelleri
 
-Bu sürüm ilk iki geliştirme adımını birleştirir: MTF yapı altyapısı ve 4A/5A onay motoru. **1A HTF demand/supply pullback** ile **3A/3C range deviation/SFP** ayrı sonraki modellerdir; mevcut scriptte varmış gibi etiketlenmezler. Onların eklenmesiyle demand/supply bölge motoru ve sabit RH/RL takibi bu altyapıya bağlanabilir.
+Bu script MTF yapı paneli ve 4A/5A motorunu içerir. **1A HTF demand/supply pullback** ayrı [pa_htf_pullback.pine](pine/pa_htf_pullback.pine), **3A/3C range deviation/SFP** ayrı [pa_range_setups.pine](pine/pa_range_setups.pine) dosyalarına eklendi. Otomatik bölge, sabit range, onay sırası ve zamanlama tercihleri [pullback_range.md](pullback_range.md) dosyasındadır. Bunları kullanmak için 4A/5A scriptini çalıştırmak gerekmez.

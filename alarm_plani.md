@@ -115,6 +115,8 @@ Bu dosya ilk uygulamanın seçimlerini açıklar; `strategy.md` içeriği deği�
 
 İlk iki yeni altyapı adımı `pine/pa_playbook_engine.pine` içinde hazırlandı: Daily–4H–45m swing/internal paneli ve 4A/5A için sweep → ChoCh → ilk retest takibi. Kurulum ve açık uygulama tercihleri `playbook_engine.md` dosyasındadır. TradingView doğrulaması kullanıcıya aittir.
 
+Playbook 1A için otomatik demand/supply + discount/OTE pullback modeli [pa_htf_pullback.pine](pine/pa_htf_pullback.pine), 3A/3C için sabit range deviation/SFP modeli [pa_range_setups.pine](pine/pa_range_setups.pine) dosyasına eklendi. Bu modellerin ayrıntıları [pullback_range.md](pullback_range.md), tüm dosyaların dizini [README.md](README.md) içindedir. Aşağıdaki genel listedeki SFP'nin diğer seviye türleri, SR flip, Monday range ve IFVG/BPR gibi kapsamlar bunlarla otomatik tamamlanmış sayılmaz.
+
 | Sıra | Script / modül | Alarm koşulu | Notlardaki karşılık |
 |---|---|---|---|
 | 1 | Kesişim radarı — bu sürüm | WO/MO çevresinde aynı yönlü SR/FVG/OB teması | §3.10, §5; MPA #03 |
