@@ -1,11 +1,11 @@
 //@version=6
-indicator("MPA | Market Monitor v0.1", overlay = true, max_bars_back = 600, max_boxes_count = 200, max_labels_count = 100)
+indicator("MPA | Market Monitor v0.2", overlay = true, max_bars_back = 600, max_boxes_count = 200, max_labels_count = 100)
 
 // ONE indicator, ONE alert: select "Any alert() function call".
 // Built by scripts/build_monitor.py. Installation: monitor_kullanim.md.
 // Monitors the chart symbol. Does not place orders or scan a whole watchlist.
 string MON_MAIN = "1. Izleme"
-string monMode = input.string("Onayli adaylar", "Ne zaman haber versin?", options = ["Onayli adaylar", "Erken bolge + onayli adaylar"], group = MON_MAIN)
+string monMode = input.string("Aday + onay", "Ne zaman haber versin?", options = ["Aday + onay", "Onayli adaylar", "Bolge + aday + onay"], group = MON_MAIN)
 string monDirection = input.string("Iki yon", "Yon", options = ["Iki yon", "Long", "Short"], group = MON_MAIN)
 float monMinRR = input.float(1.50, "Onayli aday icin minimum R/R", minval = 0.5, step = 0.25, group = MON_MAIN)
 int monMinGroups = input.int(3, "Erken bolge: minimum kesisim grubu / 4", minval = 2, maxval = 4, group = MON_MAIN)
@@ -22,13 +22,15 @@ bool monShowLevels = input.bool(true, "WO / MO / sabit range seviyeleri", group 
 bool monShowZones = input.bool(false, "Ayrintili bolge kutulari", group = MON_VIEW)
 bool monShowPanel = input.bool(true, "Tek durum paneli", group = MON_VIEW)
 bool monShowLabels = input.bool(true, "Bildirim mumuna isaret koy", group = MON_VIEW)
-int monKeepBars = input.int(72, "Son onayli adayin seviyelerini goster: grafik mumu", minval = 1, maxval = 500, group = MON_VIEW)
+int monKeepBars = input.int(72, "Guncel aday karti: en fazla grafik mumu", minval = 1, maxval = 500, group = MON_VIEW)
+int monStatsDays = input.int(30, "Teshis sayaclari: son takvim gunu", minval = 1, maxval = 180, group = MON_VIEW)
 
 // Shared working profile: 5m/15m chart -> 45m confirmation -> 4H context -> Daily.
 string monBiasTf = "1D"
 string monZoneTf = "240"
 string monConfirmTf = "45"
-bool monEarly = monMode == "Erken bolge + onayli adaylar"
+bool monEarly = monMode == "Bolge + aday + onay"
+bool monNotifyCandidates = monMode != "Onayli adaylar"
 if barstate.isfirst
     if not chart.is_standard or (timeframe.in_seconds() != 300 and timeframe.in_seconds() != 900)
         runtime.error("Market Monitor'u standart 5m veya 15m mum grafiginde kullanin. Varsayilan 1A tetigi 5m'dir.")
@@ -1534,6 +1536,35 @@ type MonitorEvent
     float target2
     float rr
     string reason
+    bool confirmed = true
+    int modelKey = 0
+
+// Event counts explain selection frequency; they are NOT backtest trade results.
+type MonitorStat
+    int stamp
+    int modelKey
+    int kind
+var array<MonitorStat> monStats = array.new<MonitorStat>()
+var array<int> monCounts = array.new_int(20, 0)
+var array<string> monFailures = array.new_string(5, "Henuz elenme yok")
+var array<int> monFailureTimes = array.new_int(5, na)
+var int monStatsDroppedAt = na
+var int monFirstLoaded = time
+f_mon_record(int modelKey, int kind) =>
+    array.push(monStats, MonitorStat.new(time_close, modelKey, kind))
+    int cell = modelKey * 4 + kind
+    array.set(monCounts, cell, array.get(monCounts, cell) + 1)
+f_mon_fail(int modelKey, string reason) =>
+    array.set(monFailures, modelKey, reason)
+    array.set(monFailureTimes, modelKey, time_close)
+f_mon_count(int modelKey, int kind) =>
+    array.get(monCounts, modelKey * 4 + kind)
+f_mon_pb_state(int phase) =>
+    phase == 1 ? "ChoCh bekliyor" : phase == 2 ? "HL/LH bekliyor" : "Yeni aday araniyor"
+f_mon_sw_state(int phase) =>
+    phase == 1 ? "ChoCh bekliyor" : phase == 2 ? "Ilk retest bekliyor" : phase == 3 ? "Tepki bekliyor" : "Yeni sweep araniyor"
+f_mon_rg_state(int phase, string model) =>
+    phase == 1 ? "Range'e donus bekliyor" : phase == 2 ? (model == "3C" ? "Sonraki mum onayi" : "ChoCh bekliyor") : phase == 3 ? "Ilk retest bekliyor" : phase == 4 ? "Tepki bekliyor" : phase == 5 ? "4H kapanisi bekliyor" : "Yeni aday araniyor"
 
 var array<MonitorEvent> monEvents = array.new<MonitorEvent>()
 f_mon_price(float price) =>
@@ -1541,18 +1572,19 @@ f_mon_price(float price) =>
 f_mon_side(int side) =>
     side == 1 ? "LONG" : side == -1 ? "SHORT" : "IKI YON"
 f_mon_row(MonitorEvent e) =>
-    string result = e.model + " | " + f_mon_side(e.side) + " | referans=" + f_mon_price(e.reference)
+    string result = (e.confirmed ? "ONAY | " : "ADAY | ") + e.model + " | " + f_mon_side(e.side) + " | referans=" + f_mon_price(e.reference)
     result += " | stop=" + f_mon_price(e.stop) + " | hedef=" + f_mon_price(e.target1)
     if not na(e.target2)
         result += " | hedef2=" + f_mon_price(e.target2)
-    result += " | RR=" + str.tostring(e.rr, "#.##") + "\n" + e.reason + " | id=" + e.setupId
+    result += " | RR=" + (na(e.rr) ? "onayda hesaplanacak" : str.tostring(e.rr, "#.##")) + "\n" + e.reason + " | id=" + e.setupId
     result
 
 var int monLastBar = na
 var int monFocusBar = na
 var int monLastSide = 0
-var string monLastTitle = "Henuz bildirim yok"
+var string monLastTitle = "Yuklu veride sinyal yok"
 var string monLastTime = "-"
+var bool monLastRealtime = false
 var string monFocusStatus = "-"
 var string monFocusModel = "-"
 var int monFocusSide = 0
@@ -1560,35 +1592,111 @@ var float monFocusReference = na
 var float monFocusStop = na
 var float monFocusTarget = na
 var float monFocusTarget2 = na
+var bool monFocusActive = false
+var bool monFocusConfirmed = false
+var string monFocusId = ""
+var int monFocusKey = 0
 bool monSentReady = false
+bool monSentCandidate = false
 bool monSentWatch = false
 bool monConflict = false
 string monMessage = ""
 
 if barstate.isconfirmed
     array.clear(monEvents)
+    // Count source events even if their notification mode is disabled.
+    for i = 0 to 1
+        pb_Setup p = array.get(pb_setups, i)
+        if mon1A and p.createdBar == bar_index
+            f_mon_record(0, 0)
+        if mon1A and p.terminalBar == bar_index
+            f_mon_record(0, p.phase == 3 ? 1 : p.phase == 4 ? 2 : 3)
+            if p.phase >= 4
+                f_mon_fail(0, p.reason)
+        sw_Setup w = array.get(sw_setups, i)
+        int key = w.model == "4A" ? 1 : 2
+        if w.createdBar == bar_index
+            f_mon_record(key, 0)
+        if w.terminalBar == bar_index
+            f_mon_record(key, w.phase == 4 ? 1 : w.phase == 5 ? 2 : 3)
+            if w.phase >= 5
+                f_mon_fail(key, w.reason)
+    int rangeKey = rg_s.model == "3A" ? 3 : 4
+    if rg_s.createdBar == bar_index
+        f_mon_record(rangeKey, 0)
+    if rg_s.terminalBar == bar_index
+        f_mon_record(rangeKey, rg_s.phase == 6 ? 1 : rg_s.phase == 7 ? 2 : 3)
+        if rg_s.phase >= 7
+            f_mon_fail(rangeKey, rg_s.reason)
+    int cutoff = time_close - monStatsDays * 86400000
+    while array.size(monStats) > 0
+        MonitorStat oldest = array.get(monStats, 0)
+        bool outsideWindow = oldest.stamp < cutoff
+        bool overCapacity = array.size(monStats) > 5000
+        if not outsideWindow and not overCapacity
+            break
+        MonitorStat removed = array.shift(monStats)
+        int cell = removed.modelKey * 4 + removed.kind
+        array.set(monCounts, cell, array.get(monCounts, cell) - 1)
+        if overCapacity and not outsideWindow
+            monStatsDroppedAt := removed.stamp
+
     // This is a last-alert reference card, not simulated position management.
-    if not na(monFocusBar) and bar_index > monFocusBar and monFocusStatus == "Yeni aday; grafigi kontrol et"
-        bool stopSeen = monFocusSide == 1 ? low <= monFocusStop : high >= monFocusStop
-        bool targetSeen = monFocusSide == 1 ? high >= monFocusTarget : low <= monFocusTarget
-        if stopSeen or targetSeen
-            monFocusStatus := stopSeen and targetSeen ? "Stop ve ilk hedef ayni mumda goruldu" : stopSeen ? "Stop referansi goruldu" : "Ilk hedef referansi goruldu"
-        else if bar_index - monFocusBar >= monKeepBars
-            monFocusStatus := "Eski aday; yeniden degerlendir"
+    if monFocusActive and not na(monFocusBar) and bar_index > monFocusBar
+        if bar_index - monFocusBar >= monKeepBars
+            monFocusActive := false
+            monFocusStatus := "Gosterim suresi doldu"
+        else if monFocusConfirmed
+            bool stopSeen = monFocusSide == 1 ? low <= monFocusStop : high >= monFocusStop
+            bool targetSeen = monFocusSide == 1 ? high >= monFocusTarget : low <= monFocusTarget
+            if stopSeen or targetSeen
+                monFocusActive := false
+                monFocusStatus := stopSeen and targetSeen ? "Stop ve ilk hedef ayni mumda goruldu" : stopSeen ? "Stop referansi goruldu" : "Ilk hedef referansi goruldu"
+        else if monFocusKey == 0
+            pb_Setup p = array.get(pb_setups, monFocusSide == 1 ? 0 : 1)
+            monFocusActive := p.id == monFocusId and p.phase >= 1 and p.phase <= 2
+            monFocusStatus := monFocusActive ? f_mon_pb_state(p.phase) : "Aday sona erdi"
+        else if monFocusKey == 1 or monFocusKey == 2
+            sw_Setup w = array.get(sw_setups, monFocusSide == 1 ? 0 : 1)
+            monFocusActive := w.id == monFocusId and w.phase >= 1 and w.phase <= 3
+            monFocusStatus := monFocusActive ? f_mon_sw_state(w.phase) : "Aday sona erdi"
+            if monFocusActive
+                monFocusTarget := w.target
+        else
+            monFocusActive := rg_s.id == monFocusId and rg_s.phase >= 1 and rg_s.phase <= 5
+            monFocusStatus := monFocusActive ? f_mon_rg_state(rg_s.phase, rg_s.model) : "Aday sona erdi"
+            if monFocusActive
+                monFocusStop := rg_s.stop
 
     if mon1A and pb_readyLong
         array.push(monEvents, MonitorEvent.new("1A Pullback", 1, pb_longSetup.id, pb_longSetup.entry, pb_longSetup.stop, pb_longSetup.target, na, pb_longSetup.rr, "HTF bolge + discount/OTE + ChoCh + HL tamamlandi"))
     if mon1A and pb_readyShort
         array.push(monEvents, MonitorEvent.new("1A Pullback", -1, pb_shortSetup.id, pb_shortSetup.entry, pb_shortSetup.stop, pb_shortSetup.target, na, pb_shortSetup.rr, "HTF bolge + discount/OTE + ChoCh + LH tamamlandi"))
     if sw_readyLong
-        array.push(monEvents, MonitorEvent.new(sw_longSetup.model + " Sweep / retest", 1, sw_longSetup.id, sw_longSetup.entry, sw_longSetup.stop, sw_longSetup.target, na, sw_longSetup.rr, "Sweep + ChoCh + ilk retest tepkisi tamamlandi"))
+        array.push(monEvents, MonitorEvent.new(sw_longSetup.model + " Sweep / retest", 1, sw_longSetup.id, sw_longSetup.entry, sw_longSetup.stop, sw_longSetup.target, na, sw_longSetup.rr, "Sweep + ChoCh + ilk retest tepkisi tamamlandi", true, sw_longSetup.model == "4A" ? 1 : 2))
     if sw_readyShort
-        array.push(monEvents, MonitorEvent.new(sw_shortSetup.model + " Sweep / retest", -1, sw_shortSetup.id, sw_shortSetup.entry, sw_shortSetup.stop, sw_shortSetup.target, na, sw_shortSetup.rr, "Sweep + ChoCh + ilk retest tepkisi tamamlandi"))
+        array.push(monEvents, MonitorEvent.new(sw_shortSetup.model + " Sweep / retest", -1, sw_shortSetup.id, sw_shortSetup.entry, sw_shortSetup.stop, sw_shortSetup.target, na, sw_shortSetup.rr, "Sweep + ChoCh + ilk retest tepkisi tamamlandi", true, sw_shortSetup.model == "4A" ? 1 : 2))
     if rg_readyLong or rg_readyShort
-        array.push(monEvents, MonitorEvent.new(rg_s.model + " Range", rg_s.side, rg_s.id, rg_s.entry, rg_s.stop, rg_s.eq, rg_s.side == 1 ? rg_s.rh : rg_s.rl, rg_s.rr1, rg_s.reason))
+        array.push(monEvents, MonitorEvent.new(rg_s.model + " Range", rg_s.side, rg_s.id, rg_s.entry, rg_s.stop, rg_s.eq, rg_s.side == 1 ? rg_s.rh : rg_s.rl, rg_s.rr1, rg_s.reason, true, rangeKey))
+
+    // Notify once when a contextual setup starts; confirmation keeps the SAME setup ID.
+    // A confirmed event takes priority over new candidate/zone notices on the same candle.
+    if monNotifyCandidates and array.size(monEvents) == 0
+        for i = 0 to 1
+            pb_Setup p = array.get(pb_setups, i)
+            if mon1A and p.createdBar == bar_index and p.phase == 1
+                array.push(monEvents, MonitorEvent.new("1A Pullback", p.side, p.id, close, p.stop, p.target, na, na, "Bolge + discount temasi var; ChoCh ve HL/LH onayi BEKLENIYOR", false, 0))
+            sw_Setup w = array.get(sw_setups, i)
+            if w.createdBar == bar_index and w.phase == 1
+                array.push(monEvents, MonitorEvent.new(w.model + " Sweep / retest", w.side, w.id, close, w.stop, na, na, na, "Baglama uygun sweep var; ChoCh ve ilk retest BEKLENIYOR", false, w.model == "4A" ? 1 : 2))
+        if rg_s.createdBar == bar_index and (rg_s.phase == 1 or rg_s.phase == 2)
+            string reason = rg_s.model == "3C" ? "SFP var; sonraki yonlu mum ve 4H kapanisi BEKLENIYOR" : "Range disina sapma var; geri donus, ChoCh ve retest BEKLENIYOR"
+            array.push(monEvents, MonitorEvent.new(rg_s.model + " Range", rg_s.side, rg_s.id, close, rg_s.stop, rg_s.eq, rg_s.side == 1 ? rg_s.rh : rg_s.rl, na, reason, false, rangeKey))
 
     int total = array.size(monEvents)
     if total > 0
+        MonitorEvent firstEvent = array.get(monEvents, 0)
+        bool confirmedEvent = firstEvent.confirmed
         bool hasLong = false
         bool hasShort = false
         string modelList = ""
@@ -1599,29 +1707,36 @@ if barstate.isconfirmed
             modelList += (i == 0 ? "" : " + ") + e.model
         monConflict := hasLong and hasShort
         monLastSide := monConflict ? 0 : hasLong ? 1 : -1
-        monLastTitle := monConflict ? "YON CELISKISI | " + modelList : "KONTROL ET | " + modelList
+        monLastTitle := (monConflict ? "YON CELISKISI | " : confirmedEvent ? "ONAY | " : "ADAY | ") + modelList
         monLastTime := str.format_time(time_close, "yyyy-MM-dd HH:mm", "Europe/Istanbul") + " TR"
         monMessage := "MPA MONITOR | " + syminfo.tickerid + " | " + f_mon_side(monLastSide) + "\n" + monLastTitle
         monMessage += "\nGrafik: " + timeframe.period + "m | " + monLastTime
         for i = 0 to total - 1
             monMessage += "\n\n" + f_mon_row(array.get(monEvents, i))
         monMessage += "\n\nWO=" + f_mon_price(rd_wo) + " | MO=" + f_mon_price(rd_mo)
-        monMessage += monConflict ? "\nModeller ayni mumda ters yon verdi; tek yonlu aday kabul etme." : "\nOnay anindaki adaydir. Grafigi acip guncel fiyati ve yapinin korunmasini kontrol et."
-        monSentReady := true
+        monMessage += monConflict ? "\nModeller ayni mumda ters yon verdi; tek yonlu aday kabul etme." : confirmedEvent ? "\nOnay anindaki adaydir. Grafigi acip guncel fiyati ve yapinin korunmasini kontrol et." : "\nErken inceleme adayi; giris onayi tamamlanmadi. Seviyeler taslaktir, minimum R/R onay asamasinda kontrol edilir."
+        monSentReady := confirmedEvent
+        monSentCandidate := not confirmedEvent
+        monLastRealtime := barstate.isrealtime
         monLastBar := bar_index
         // One representative for chart levels; all setups retain separate levels in the alert.
         // Ordering is deterministic: 1A, 4A/5A, range. No probability ranking is implied.
         if not monConflict
             MonitorEvent focus = array.get(monEvents, 0)
             monFocusBar := bar_index
+            monFocusActive := true
+            monFocusConfirmed := focus.confirmed
+            monFocusKey := focus.modelKey
+            monFocusId := focus.setupId
             monFocusModel := focus.model
             monFocusSide := focus.side
             monFocusReference := focus.reference
             monFocusStop := focus.stop
             monFocusTarget := focus.target1
             monFocusTarget2 := focus.target2
-            monFocusStatus := "Yeni aday; grafigi kontrol et"
+            monFocusStatus := focus.confirmed ? "Onay tamamlandi; yeniden kontrol et" : "Onay bekleniyor"
         else
+            monFocusActive := false
             monFocusBar := na
             monFocusModel := "Ayni mumda ters yonler"
             monFocusStatus := "Tek yonlu seviye karti kapatildi"
@@ -1639,6 +1754,7 @@ if barstate.isconfirmed
         monLastTitle := "BOLGE TEMASI | " + (weekly ? "WO" : "MO") + reasons
         monLastTime := str.format_time(time_close, "yyyy-MM-dd HH:mm", "Europe/Istanbul") + " TR"
         monLastBar := bar_index
+        monLastRealtime := barstate.isrealtime
         monMessage := "MPA MONITOR | " + syminfo.tickerid + " | " + f_mon_side(side) + "\n" + monLastTitle
         monMessage += "\n" + monLastTime + " | Grafik: " + timeframe.period + "m | kesisim=" + str.tostring(score) + "/4"
         monMessage += "\nSeviye=" + f_mon_price(anchor) + " | yakinlik +/- " + f_mon_price(rd_tolerance) + " | kapanis=" + f_mon_price(close)
@@ -1647,37 +1763,78 @@ if barstate.isconfirmed
 
     // Exactly one dynamic alert endpoint. Simultaneous models cannot swallow each other.
     if str.length(monMessage) > 0
-        alert(monMessage, alert.freq_once_per_bar_close)
+        if barstate.isrealtime
+            alert(monMessage, alert.freq_once_per_bar_close)
         if monShowLabels
-            label.new(bar_index, monLastSide == 1 ? low : high, monSentWatch ? "BOLGE" : monConflict ? "IKI YON" : "KONTROL ET", style = monLastSide == 1 ? label.style_label_up : label.style_label_down, color = monConflict ? color.gray : monSentWatch ? color.blue : monLastSide == 1 ? color.teal : color.orange, textcolor = color.white, size = size.small, tooltip = monMessage)
+            label.new(bar_index, monLastSide == 1 ? low : high, monSentWatch ? "BOLGE" : monConflict ? "IKI YON" : monSentCandidate ? "ADAY" : "ONAY", style = monLastSide == 1 ? label.style_label_up : label.style_label_down, color = monConflict ? color.gray : monSentWatch or monSentCandidate ? color.blue : monLastSide == 1 ? color.teal : color.orange, textcolor = color.white, size = size.small, tooltip = monMessage)
 
-bool monFocusVisible = not na(monFocusBar) and bar_index - monFocusBar < monKeepBars
+bool monFocusVisible = monFocusActive and not na(monFocusBar) and bar_index - monFocusBar < monKeepBars
 plot(monShowLevels ? rd_wo : na, "Weekly Open", color.yellow, style = plot.style_stepline)
 plot(monShowLevels ? rd_mo : na, "Monthly Open", color.fuchsia, style = plot.style_stepline)
 plot(monShowLevels and rg_hAlive ? rg_hRH : na, "Sabit Range High", color.new(color.orange, 30), style = plot.style_linebr)
 plot(monShowLevels and rg_hAlive ? rg_hRL : na, "Sabit Range Low", color.new(color.teal, 30), style = plot.style_linebr)
 plot(monShowLevels and rg_hAlive ? (rg_hRH + rg_hRL) / 2 : na, "Range EQ", color.gray, style = plot.style_linebr)
-plot(monFocusVisible ? monFocusReference : na, "Son onayli aday - referans", color.white, style = plot.style_linebr)
-plot(monFocusVisible ? monFocusStop : na, "Son onayli aday - stop", color.red, style = plot.style_linebr)
-plot(monFocusVisible ? monFocusTarget : na, "Son onayli aday - hedef 1", color.lime, style = plot.style_linebr)
-plot(monFocusVisible ? monFocusTarget2 : na, "Son onayli aday - hedef 2", color.new(color.lime, 40), style = plot.style_linebr)
+plot(monFocusVisible ? monFocusReference : na, "Guncel aday - referans", color.white, style = plot.style_linebr)
+plot(monFocusVisible ? monFocusStop : na, "Guncel aday - stop", color.red, style = plot.style_linebr)
+plot(monFocusVisible ? monFocusTarget : na, "Guncel aday - hedef 1", color.lime, style = plot.style_linebr)
+plot(monFocusVisible ? monFocusTarget2 : na, "Guncel aday - hedef 2", color.new(color.lime, 40), style = plot.style_linebr)
 
 f_mon_cell(table panel, int row, string labelText, string value, color ink) =>
     table.cell(panel, 0, row, labelText, text_color = color.silver, text_size = size.small)
     table.cell(panel, 1, row, value, text_color = ink, text_size = size.small)
-var table monPanel = table.new(position.top_right, 2, 11, bgcolor = color.new(color.black, 12), border_width = 1)
+f_mon_model_cell(table panel, int row, int key, string name, string state) =>
+    string counts = str.tostring(f_mon_count(key, 0)) + " / " + str.tostring(f_mon_count(key, 1))
+    int failureTime = array.get(monFailureTimes, key)
+    bool recentFailure = not na(failureTime) and failureTime >= time_close - monStatsDays * 86400000
+    string detail = "Aday: " + str.tostring(f_mon_count(key, 0)) + " | Onay: " + str.tostring(f_mon_count(key, 1))
+    detail += "\nElenen: " + str.tostring(f_mon_count(key, 2)) + " | Suresi dolan: " + str.tostring(f_mon_count(key, 3))
+    detail += "\nSon neden: " + (recentFailure ? array.get(monFailures, key) : "Bu donemde elenme yok")
+    f_mon_cell(panel, row, name, state, color.white)
+    table.cell(panel, 2, row, counts, text_color = color.aqua, text_size = size.small, tooltip = detail)
+f_mon_sweep_state(string model) =>
+    bool l = sw_longSetup.model == model and sw_longSetup.phase >= 1 and sw_longSetup.phase <= 3
+    bool r = sw_shortSetup.model == model and sw_shortSetup.phase >= 1 and sw_shortSetup.phase <= 3
+    string state = l ? "L: " + f_mon_sw_state(sw_longSetup.phase) : ""
+    state += r ? (l ? " | " : "") + "S: " + f_mon_sw_state(sw_shortSetup.phase) : ""
+    not sw_dataReady ? "HTF veri / yapi bekleniyor" : l or r ? state : "Yeni sweep araniyor"
+f_mon_range_state(string model) =>
+    bool active = rg_s.phase >= 1 and rg_s.phase <= 5
+    not rg_hAlive ? "Range araniyor" : active ? (rg_s.model == model ? f_mon_side(rg_s.side) + ": " + f_mon_rg_state(rg_s.phase, model) : "Diger range adayi izleniyor") : "Yeni " + (model == "3A" ? "sapma" : "SFP") + " bekleniyor"
+var table monPanel = table.new(position.top_right, 3, 14, bgcolor = color.new(color.black, 12), border_width = 1)
 if barstate.islast and monShowPanel
-    f_mon_cell(monPanel, 0, "MPA MARKET MONITOR", syminfo.ticker + " | " + timeframe.period + "m", color.white)
+    f_mon_cell(monPanel, 0, "MPA MONITOR v0.2", syminfo.ticker + " | " + timeframe.period + "m", color.white)
+    table.cell(monPanel, 2, 0, "Aday / Onay\n" + str.tostring(monStatsDays) + " gun", text_color = color.aqua, text_size = size.small)
     f_mon_cell(monPanel, 1, "Piyasa", sw_regimeText, color.white)
-    string pullbackState = mon1A ? ("L: " + pb_f_phase(pb_longSetup.phase) + " | S: " + pb_f_phase(pb_shortSetup.phase)) : "Kapali"
-    f_mon_cell(monPanel, 2, "1A Pullback", pullbackState, color.white)
-    string sweepState = mon4A or mon5A ? (sw_longSetup.model + " L: " + sw_f_phase(sw_longSetup.phase) + " | " + sw_shortSetup.model + " S: " + sw_f_phase(sw_shortSetup.phase)) : "Kapali"
-    f_mon_cell(monPanel, 3, "4A / 5A", sweepState, color.white)
-    string rangeState = mon3A or mon3C ? (rg_hAlive ? rg_s.model + " " + rg_f_phase(rg_s.phase) : "Otomatik range araniyor") : "Kapali"
-    f_mon_cell(monPanel, 4, "3A / 3C", rangeState, color.white)
-    f_mon_cell(monPanel, 5, "Bildirim modu", monMode, color.white)
-    f_mon_cell(monPanel, 6, "Son bildirim", monLastTitle + " | " + monLastTime, color.yellow)
-    f_mon_cell(monPanel, 7, "Son onayli aday", monFocusModel + " | " + monFocusStatus, color.white)
-    f_mon_cell(monPanel, 8, "Referans / stop", f_mon_price(monFocusReference) + " / " + f_mon_price(monFocusStop), color.white)
-    f_mon_cell(monPanel, 9, "Hedef 1 / 2", f_mon_price(monFocusTarget) + " / " + f_mon_price(monFocusTarget2), color.white)
-    f_mon_cell(monPanel, 10, "Alarm kurulumu", "Any alert() function call | uygulama bildirimi", color.silver)
+    bool pullbackLong = pb_longSetup.phase >= 1 and pb_longSetup.phase <= 2
+    bool pullbackShort = pb_shortSetup.phase >= 1 and pb_shortSetup.phase <= 2
+    string pullbackState = pullbackLong ? "L: " + f_mon_pb_state(pb_longSetup.phase) : ""
+    pullbackState += pullbackShort ? (pullbackLong ? " | " : "") + "S: " + f_mon_pb_state(pb_shortSetup.phase) : ""
+    if not pullbackLong and not pullbackShort
+        pb_Zone lz = array.get(pb_zones, 0)
+        pb_Zone sz = array.get(pb_zones, 1)
+        pullbackState := (lz.alive and not lz.used and lz.visits <= pb_maxVisits) or (sz.alive and not sz.used and sz.visits <= pb_maxVisits) ? "Bolge temasi bekleniyor" : "Yeni bolge araniyor"
+    f_mon_model_cell(monPanel, 2, 0, "1A Pullback", mon1A ? pullbackState : "Kapali")
+    f_mon_model_cell(monPanel, 3, 1, "4A Internal sweep", mon4A ? f_mon_sweep_state("4A") : "Kapali")
+    f_mon_model_cell(monPanel, 4, 2, "5A HTF sweep", mon5A ? f_mon_sweep_state("5A") : "Kapali")
+    f_mon_model_cell(monPanel, 5, 3, "3A Deviation", mon3A ? f_mon_range_state("3A") : "Kapali")
+    f_mon_model_cell(monPanel, 6, 4, "3C SFP", mon3C ? f_mon_range_state("3C") : "Kapali")
+    string card = monFocusVisible ? (monFocusConfirmed ? "ONAY | " : "ADAY | ") + monFocusModel + " " + f_mon_side(monFocusSide) + "\n" + monFocusStatus : "Aktif kart yok; modeller izleniyor"
+    f_mon_cell(monPanel, 7, "Guncel aday", card, monFocusVisible ? color.yellow : color.silver)
+    f_mon_cell(monPanel, 8, "Referans / stop", monFocusVisible ? f_mon_price(monFocusReference) + " / " + f_mon_price(monFocusStop) : "- / -", color.white)
+    f_mon_cell(monPanel, 9, "Hedef 1 / 2", monFocusVisible ? f_mon_price(monFocusTarget) + " / " + f_mon_price(monFocusTarget2) : "- / -", color.white)
+    f_mon_cell(monPanel, 10, "Son hesaplanan sinyal", monLastTitle + "\n" + monLastTime, color.silver)
+    table.cell(monPanel, 2, 10, na(monLastBar) ? "-" : monLastRealtime ? "Canli bar\nTeslim teyidi degil" : "Gecmis veri\nBildirim degil", text_color = color.silver, text_size = size.tiny)
+    int latestFailure = na
+    string failureText = "Bu donemde yok"
+    for i = 0 to 4
+        int stamp = array.get(monFailureTimes, i)
+        if not na(stamp) and stamp >= time_close - monStatsDays * 86400000 and (na(latestFailure) or stamp > latestFailure)
+            latestFailure := stamp
+            string name = i == 0 ? "1A" : i == 1 ? "4A" : i == 2 ? "5A" : i == 3 ? "3A" : "3C"
+            failureText := name + " | " + array.get(monFailures, i)
+    f_mon_cell(monPanel, 11, "Son elenme nedeni", failureText, color.silver)
+    f_mon_cell(monPanel, 12, "Mod / alarm durumu", monMode + " | Alarm listesinden kontrol et", color.white)
+    bool limitedHistory = monFirstLoaded > time_close - monStatsDays * 86400000
+    bool limitedEvents = not na(monStatsDroppedAt) and monStatsDroppedAt >= time_close - monStatsDays * 86400000
+    string coverage = limitedEvents ? "Olay kapasitesi doldu; sayaclar eksik" : limitedHistory ? "Yuklu gecmis " + str.format_time(monFirstLoaded, "dd.MM.yyyy", "Europe/Istanbul") + " tarihinde basliyor" : "Son " + str.tostring(monStatsDays) + " gunun yuklu mumlari"
+    f_mon_cell(monPanel, 13, "Sayac kapsami", coverage + " | islem sonucu degil", color.silver)
