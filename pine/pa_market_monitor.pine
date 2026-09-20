@@ -1,0 +1,1683 @@
+//@version=6
+indicator("MPA | Market Monitor v0.1", overlay = true, max_bars_back = 600, max_boxes_count = 200, max_labels_count = 100)
+
+// ONE indicator, ONE alert: select "Any alert() function call".
+// Built by scripts/build_monitor.py. Installation: monitor_kullanim.md.
+// Monitors the chart symbol. Does not place orders or scan a whole watchlist.
+string MON_MAIN = "1. Izleme"
+string monMode = input.string("Onayli adaylar", "Ne zaman haber versin?", options = ["Onayli adaylar", "Erken bolge + onayli adaylar"], group = MON_MAIN)
+string monDirection = input.string("Iki yon", "Yon", options = ["Iki yon", "Long", "Short"], group = MON_MAIN)
+float monMinRR = input.float(1.50, "Onayli aday icin minimum R/R", minval = 0.5, step = 0.25, group = MON_MAIN)
+int monMinGroups = input.int(3, "Erken bolge: minimum kesisim grubu / 4", minval = 2, maxval = 4, group = MON_MAIN)
+
+string MON_MODELS = "2. Izlenen modeller"
+bool mon1A = input.bool(true, "1A - HTF pullback + ChoCh + HL/LH", group = MON_MODELS)
+bool mon4A = input.bool(true, "4A - Kritik seviyede internal sweep + retest", group = MON_MODELS)
+bool mon5A = input.bool(true, "5A - HTF sweep + ChoCh + retest", group = MON_MODELS)
+bool mon3A = input.bool(true, "3A - Range deviation + ChoCh + retest", group = MON_MODELS)
+bool mon3C = input.bool(true, "3C - Range SFP + sonraki mum onayi", group = MON_MODELS)
+
+string MON_VIEW = "3. Gorunum"
+bool monShowLevels = input.bool(true, "WO / MO / sabit range seviyeleri", group = MON_VIEW)
+bool monShowZones = input.bool(false, "Ayrintili bolge kutulari", group = MON_VIEW)
+bool monShowPanel = input.bool(true, "Tek durum paneli", group = MON_VIEW)
+bool monShowLabels = input.bool(true, "Bildirim mumuna isaret koy", group = MON_VIEW)
+int monKeepBars = input.int(72, "Son onayli adayin seviyelerini goster: grafik mumu", minval = 1, maxval = 500, group = MON_VIEW)
+
+// Shared working profile: 5m/15m chart -> 45m confirmation -> 4H context -> Daily.
+string monBiasTf = "1D"
+string monZoneTf = "240"
+string monConfirmTf = "45"
+bool monEarly = monMode == "Erken bolge + onayli adaylar"
+if barstate.isfirst
+    if not chart.is_standard or (timeframe.in_seconds() != 300 and timeframe.in_seconds() != 900)
+        runtime.error("Market Monitor'u standart 5m veya 15m mum grafiginde kullanin. Varsayilan 1A tetigi 5m'dir.")
+    if not mon1A and not mon4A and not mon5A and not mon3A and not mon3C and not monEarly
+        runtime.error("En az bir model veya erken bolge bildirimi acik olmali.")
+
+
+// ==================== pa_confluence_radar.pine ====================
+
+// Context alerts only. Exact implementation choices and limitations: alarm_plani.md.
+// Run on standard candles, e.g. 1H chart / 4H zones or 15m chart / 1H zones.
+string rd_zoneTf = monZoneTf
+int rd_pivotLen = 3
+int rd_srHits = 2
+float rd_srWidth = 0.10
+float rd_gapMin = 0.20
+int rd_obSearch = 20
+float rd_obMove = 1.5
+int rd_maxAge = 180
+int rd_maxZones = 60
+
+bool rd_useWo = true
+bool rd_useMo = true
+float rd_proximity = 0.25
+int rd_minimumGroups = monMinGroups
+bool rd_freshOnly = true
+bool rd_filterTrend = true
+string rd_sideInput = monDirection == "Long" ? "Long bolgesi" : monDirection == "Short" ? "Short bolgesi" : "Iki yon"
+int rd_cooldown = 12
+
+int rd_rangeMinBars = 20
+float rd_rangeMaxAtr = 6.0
+bool rd_muteEq = true
+bool rd_showZones = monShowZones
+bool rd_showRange = monShowZones
+
+if barstate.isfirst and (not chart.is_standard or timeframe.in_seconds() >= timeframe.in_seconds(rd_zoneTf))
+    runtime.error("Standart mum kullanin. Grafik TF, bolge TF'den kucuk olmali. Ornek: 1H grafik + 4H bolge.")
+
+// A zone becomes usable only after its formation / pivot confirmation is available.
+// kind: 1 = SR, 2 = FVG, 3 = OB. side: +1 = support/bullish, -1 = resistance/bearish.
+type rd_Zone
+    float lo
+    float hi
+    int side
+    int kind
+    int hits
+    int createdBar
+    bool tapped
+    box drawing
+
+var array<rd_Zone> rd_zones = array.new<rd_Zone>()
+
+rd_f_color(int kind, int side) =>
+    kind == 1 ? color.blue : kind == 2 ? (side == 1 ? color.teal : color.orange) : (side == 1 ? color.green : color.red)
+
+rd_f_name(int kind, int side, int hits) =>
+    string family = kind == 1 ? "SR " + str.tostring(hits) : kind == 2 ? "FVG" : "OB"
+    family + (side == 1 ? " +" : " -")
+
+rd_f_delete(int index) =>
+    rd_Zone z = array.remove(rd_zones, index)
+    if not na(z.drawing)
+        box.delete(z.drawing)
+
+rd_f_add(float lo, float hi, int side, int kind, int serial, int knownTime) =>
+    // Several structure breaks can point to the same still-active OB candle.
+    bool duplicate = false
+    if kind == 3 and array.size(rd_zones) > 0
+        for i = 0 to array.size(rd_zones) - 1
+            rd_Zone existing = array.get(rd_zones, i)
+            if existing.kind == kind and existing.side == side and existing.lo == lo and existing.hi == hi
+                duplicate := true
+    if not duplicate and not na(lo) and not na(hi) and hi > lo
+        if array.size(rd_zones) >= rd_maxZones
+            rd_f_delete(0)
+        color ink = rd_f_color(kind, side)
+        box drawing = na
+        if rd_showZones
+            drawing := box.new(left = knownTime, top = hi, right = time_close, bottom = lo, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(ink, 45), bgcolor = color.new(ink, 91), text = rd_f_name(kind, side, 1), text_size = size.tiny, text_color = ink)
+        array.push(rd_zones, rd_Zone.new(lo, hi, side, kind, 1, serial, false, drawing))
+
+// Distinct confirmed pivots are clustered. Candle-by-candle contact is not a new SR hit.
+rd_f_add_sr(float price, int side, float atr, int serial, int knownTime) =>
+    if not na(price) and not na(atr)
+        int match = -1
+        float best = rd_srWidth * atr * 2.0
+        if array.size(rd_zones) > 0
+            for i = 0 to array.size(rd_zones) - 1
+                rd_Zone z = array.get(rd_zones, i)
+                float distance = math.abs(price - (z.lo + z.hi) * 0.5)
+                if z.kind == 1 and z.side == side and distance <= best
+                    best := distance
+                    match := i
+        if match >= 0
+            rd_Zone z = array.get(rd_zones, match)
+            float center = (((z.lo + z.hi) * 0.5) * z.hits + price) / (z.hits + 1)
+            z.hits := z.hits + 1
+            z.lo := center - rd_srWidth * atr
+            z.hi := center + rd_srWidth * atr
+            if not na(z.drawing)
+                box.set_top(z.drawing, z.hi)
+                box.set_bottom(z.drawing, z.lo)
+                box.set_text(z.drawing, rd_f_name(z.kind, z.side, z.hits))
+        else
+            rd_f_add(price - rd_srWidth * atr, price + rd_srWidth * atr, side, 1, serial, knownTime)
+
+// This entire detector runs in the requested zone timeframe.
+rd_f_htf() =>
+    float atr = ta.atr(14)
+    float ph = ta.pivothigh(high, rd_pivotLen, rd_pivotLen)
+    float pl = ta.pivotlow(low, rd_pivotLen, rd_pivotLen)
+    var float lastH = na
+    var float prevH = na
+    var float lastL = na
+    var float prevL = na
+    var bool brokenH = false
+    var bool brokenL = false
+    if not na(ph)
+        prevH := lastH
+        lastH := ph
+        brokenH := false
+    if not na(pl)
+        prevL := lastL
+        lastL := pl
+        brokenL := false
+    int bias = not na(prevH) and not na(prevL) ? (lastH > prevH and lastL > prevL ? 1 : lastH < prevH and lastL < prevL ? -1 : 0) : 0
+    float bodyRatio = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+    float middleRatio = math.abs(close[1] - open[1]) / math.max(high[1] - low[1], syminfo.mintick)
+    bool strong = bodyRatio >= 0.65 and high - low >= 0.8 * atr
+    bool bullGap = low > high[2] and low - high[2] >= rd_gapMin * atr and middleRatio >= 0.5
+    bool bearGap = high < low[2] and low[2] - high >= rd_gapMin * atr and middleRatio >= 0.5
+    float rd_gapLo = bullGap ? high[2] : bearGap ? high : na
+    float rd_gapHi = bullGap ? low : bearGap ? low[2] : na
+    int rd_gapSide = bullGap ? 1 : bearGap ? -1 : 0
+    float rd_obLo = na
+    float rd_obHi = na
+    int rd_obSide = 0
+    // Consume the first close beyond a swing even when displacement is insufficient.
+    // This avoids treating a later continuation candle as a new structure break.
+    if not na(lastH) and not brokenH and close > lastH
+        brokenH := true
+        if strong and close > open and close - lastH >= 0.3 * atr
+            for j = 1 to rd_obSearch
+                if close[j] < open[j]
+                    if close - high[j] >= rd_obMove * atr
+                        rd_obLo := low[j]
+                        rd_obHi := high[j]
+                        rd_obSide := 1
+                    break
+    if not na(lastL) and not brokenL and close < lastL
+        brokenL := true
+        if strong and close < open and lastL - close >= 0.3 * atr
+            for j = 1 to rd_obSearch
+                if close[j] > open[j]
+                    if low[j] - close >= rd_obMove * atr
+                        rd_obLo := low[j]
+                        rd_obHi := high[j]
+                        rd_obSide := -1
+                    break
+    // Shift every developing HTF value. lookahead_on is safe with these offsets.
+    [time[1], time_close[1], bar_index[1], close[1], atr[1], ph[1], pl[1], rd_gapLo[1], rd_gapHi[1], rd_gapSide[1], rd_obLo[1], rd_obHi[1], rd_obSide[1], bias[1]]
+
+[rd_htfStamp, rd_htfEnd, rd_htfSerial, rd_htfClose, rd_htfAtr, rd_pivotH, rd_pivotL, rd_gapLo, rd_gapHi, rd_gapSide, rd_obLo, rd_obHi, rd_obSide, rd_htfBias] = request.security(syminfo.tickerid, rd_zoneTf, rd_f_htf(), lookahead = barmerge.lookahead_on)
+// Current period OPEN is already known at period start; never substitute high/low/close here.
+float rd_wo = request.security(syminfo.tickerid, "1W", open, lookahead = barmerge.lookahead_on)
+float rd_mo = request.security(syminfo.tickerid, "1M", open, lookahead = barmerge.lookahead_on)
+bool rd_newHtf = not na(rd_htfStamp) and (na(rd_htfStamp[1]) or rd_htfStamp != rd_htfStamp[1])
+
+if barstate.isconfirmed and rd_newHtf and not na(rd_htfAtr)
+    // Retire broken zones. Automatic SR flips / IFVG conversion are outside v0.1.
+    if array.size(rd_zones) > 0
+        for i = array.size(rd_zones) - 1 to 0
+            rd_Zone z = array.get(rd_zones, i)
+            bool broken = z.side == 1 ? rd_htfClose < z.lo : rd_htfClose > z.hi
+            if broken or rd_htfSerial - z.createdBar > rd_maxAge
+                rd_f_delete(i)
+    rd_f_add_sr(rd_pivotH, -1, rd_htfAtr, rd_htfSerial, rd_htfEnd)
+    rd_f_add_sr(rd_pivotL, 1, rd_htfAtr, rd_htfSerial, rd_htfEnd)
+    if rd_gapSide != 0
+        rd_f_add(rd_gapLo, rd_gapHi, rd_gapSide, 2, rd_htfSerial, rd_htfEnd)
+    if rd_obSide != 0
+        rd_f_add(rd_obLo, rd_obHi, rd_obSide, 3, rd_htfSerial, rd_htfEnd)
+
+// Range candidate = nearest qualified support and resistance enclosing HTF close.
+// This is an explicit heuristic, not an assertion that every enclosed price is ranging.
+float rd_rangeLo = na
+float rd_rangeHi = na
+int rd_supportBorn = na
+int rd_resistanceBorn = na
+if array.size(rd_zones) > 0
+    for i = 0 to array.size(rd_zones) - 1
+        rd_Zone z = array.get(rd_zones, i)
+        float center = (z.lo + z.hi) * 0.5
+        if z.kind == 1 and z.hits >= rd_srHits
+            if z.side == 1 and center < rd_htfClose and (na(rd_rangeLo) or center > rd_rangeLo)
+                rd_rangeLo := center
+                rd_supportBorn := z.createdBar
+            if z.side == -1 and center > rd_htfClose and (na(rd_rangeHi) or center < rd_rangeHi)
+                rd_rangeHi := center
+                rd_resistanceBorn := z.createdBar
+bool rd_rangeValid = not na(rd_rangeLo) and not na(rd_rangeHi) and rd_rangeHi > rd_rangeLo and rd_rangeHi - rd_rangeLo <= rd_rangeMaxAtr * rd_htfAtr and rd_htfSerial - math.max(rd_supportBorn, rd_resistanceBorn) >= rd_rangeMinBars
+float rd_rangeEq = rd_rangeValid ? (rd_rangeHi + rd_rangeLo) * 0.5 : na
+bool rd_inEq = rd_rangeValid and math.abs(close - rd_rangeEq) <= (rd_rangeHi - rd_rangeLo) * 0.10
+
+// Count concept families once. WO + MO still counts as ONE opening family.
+// Every participating zone must be close to the SAME anchor price, in the SAME direction.
+rd_f_check(float anchor, int side, float rd_tolerance) =>
+    bool sr = false
+    bool fvg = false
+    bool ob = false
+    bool actualTouch = false
+    if not na(anchor) and not na(rd_tolerance) and array.size(rd_zones) > 0
+        for i = 0 to array.size(rd_zones) - 1
+            rd_Zone z = array.get(rd_zones, i)
+            bool nearAnchor = z.hi >= anchor - rd_tolerance and z.lo <= anchor + rd_tolerance
+            bool eligible = z.side == side and nearAnchor and (z.kind == 1 ? z.hits >= rd_srHits : not rd_freshOnly or not z.tapped)
+            // A candle that closes through the far edge is not a supportive contact.
+            bool held = side == 1 ? close >= z.lo : close <= z.hi
+            if eligible and held
+                sr := sr or z.kind == 1
+                fvg := fvg or z.kind == 2
+                ob := ob or z.kind == 3
+                actualTouch := actualTouch or (high >= z.lo and low <= z.hi)
+    int score = 1 + (sr ? 1 : 0) + (fvg ? 1 : 0) + (ob ? 1 : 0)
+    bool touched = not na(anchor) and high >= anchor - rd_tolerance and low <= anchor + rd_tolerance and actualTouch
+    string reasons = (sr ? " + SR" : "") + (fvg ? " + FVG" : "") + (ob ? " + OB" : "")
+    [score, touched, reasons]
+
+float rd_tolerance = rd_proximity * rd_htfAtr
+[rd_wlScore, rd_wlTouch, rd_wlWhy] = rd_f_check(rd_useWo ? rd_wo : na, 1, rd_tolerance)
+[rd_mlScore, rd_mlTouch, rd_mlWhy] = rd_f_check(rd_useMo ? rd_mo : na, 1, rd_tolerance)
+[rd_wsScore, rd_wsTouch, rd_wsWhy] = rd_f_check(rd_useWo ? rd_wo : na, -1, rd_tolerance)
+[rd_msScore, rd_msTouch, rd_msWhy] = rd_f_check(rd_useMo ? rd_mo : na, -1, rd_tolerance)
+bool rd_wl = rd_wlTouch and rd_wlScore >= rd_minimumGroups
+bool rd_ml = rd_mlTouch and rd_mlScore >= rd_minimumGroups
+bool rd_ws = rd_wsTouch and rd_wsScore >= rd_minimumGroups
+bool rd_ms = rd_msTouch and rd_msScore >= rd_minimumGroups
+bool rd_allowLong = rd_sideInput != "Short bolgesi" and (not rd_filterTrend or rd_htfBias != -1)
+bool rd_allowShort = rd_sideInput != "Long bolgesi" and (not rd_filterTrend or rd_htfBias != 1)
+bool rd_contextAllowed = not (rd_muteEq and rd_inEq)
+bool rd_longContext = (rd_wl or rd_ml) and rd_allowLong and rd_contextAllowed
+bool rd_shortContext = (rd_ws or rd_ms) and rd_allowShort and rd_contextAllowed
+// If both directional contexts trigger together, suppress the ambiguous notification.
+bool rd_ambiguous = rd_longContext and rd_shortContext
+bool rd_longReady = rd_longContext and not rd_ambiguous
+bool rd_shortReady = rd_shortContext and not rd_ambiguous
+var int rd_lastLongAlert = na
+var int rd_lastShortAlert = na
+bool rd_fireLong = barstate.isconfirmed and rd_longReady and not rd_longReady[1] and (na(rd_lastLongAlert) or bar_index - rd_lastLongAlert >= rd_cooldown)
+bool rd_fireShort = barstate.isconfirmed and rd_shortReady and not rd_shortReady[1] and (na(rd_lastShortAlert) or bar_index - rd_lastShortAlert >= rd_cooldown)
+string rd_biasText = rd_htfBias == 1 ? "HH/HL" : rd_htfBias == -1 ? "LH/LL" : "Belirsiz / karisik"
+
+rd_f_message(string side, string source, int score, float anchor, string bias) =>
+    "MPA v0.1 | WATCH " + side + " | " + syminfo.tickerid + " | Grafik " + timeframe.period + " / Bolge " + rd_zoneTf + " | " + source + " | Grup " + str.tostring(score) + "/4 | Seviye " + str.tostring(anchor, format.mintick) + " | Yakinlik +/- " + str.tostring(rd_tolerance, format.mintick) + " | Kapanis " + str.tostring(close, format.mintick) + " | HTF " + bias + " | Bolge temasi: giris onayi degil."
+
+if rd_fireLong
+    bool pickWeekly = rd_wl and (not rd_ml or rd_wlScore >= rd_mlScore)
+    rd_lastLongAlert := bar_index
+if rd_fireShort
+    bool pickWeekly = rd_ws and (not rd_ms or rd_wsScore >= rd_msScore)
+    rd_lastShortAlert := bar_index
+
+// Update freshness AFTER all four anchor/direction checks, so iteration order is irrelevant.
+// Full wick fill retires an FVG; partial tap retires freshness, not the physical zone.
+if barstate.isconfirmed and array.size(rd_zones) > 0
+    for i = array.size(rd_zones) - 1 to 0
+        rd_Zone z = array.get(rd_zones, i)
+        if z.kind != 1 and high >= z.lo and low <= z.hi
+            z.tapped := true
+            bool fullFill = z.kind == 2 and (z.side == 1 ? low <= z.lo : high >= z.hi)
+            if fullFill
+                rd_f_delete(i)
+            else if not na(z.drawing)
+                box.set_bgcolor(z.drawing, color.new(rd_f_color(z.kind, z.side), 96))
+
+
+// ==================== pa_playbook_engine.pine ====================
+
+// Standalone indicator. Setup alerts are not broker orders or position tracking.
+// Implementation choices, timing and installation: playbook_engine.md.
+string sw_biasTf = monBiasTf
+string sw_contextTf = monZoneTf
+string sw_confirmTf = monConfirmTf
+int sw_swingLen = 5
+int sw_internalLen = 2
+float sw_breakBuffer = 0.05
+float sw_sweepBuffer = 0.10
+int sw_regimeLen = 20
+float sw_efficiencyMax = 0.25
+float sw_compressionMax = 6.0
+
+bool sw_use4A = mon4A
+bool sw_use5A = mon5A
+string sw_directionInput = monDirection
+string sw_biasPolicy = "Ters yone izin ver"
+float sw_levelNearAtr = 0.35
+int sw_confirmWait = 8
+int sw_retestWait = 8
+int sw_cooldownBars = 12
+
+float sw_displacementBody = 0.60
+float sw_displacementRange = 0.80
+float sw_displacementClose = 0.10
+float sw_retestHalfWidth = 0.10
+int sw_reactionBars = 3
+bool sw_requireCandleDirection = true
+float sw_maximumChase = 0.50
+float sw_stopBuffer = 0.10
+float sw_minimumRR = monMinRR
+
+string sw_notifyMode = "Sadece hazir"
+bool sw_notifyBias = false
+bool sw_showLevels = false
+bool sw_showSetup = monShowZones
+bool sw_showLabels = false
+bool sw_showBackground = false
+
+float sw_chartSeconds = timeframe.in_seconds()
+float sw_biasSeconds = timeframe.in_seconds(sw_biasTf)
+float sw_contextSeconds = timeframe.in_seconds(sw_contextTf)
+float sw_confirmSeconds = timeframe.in_seconds(sw_confirmTf)
+if barstate.isfirst
+    if not chart.is_standard or not timeframe.isintraday
+        runtime.error("Standart intraday mum kullanin. Onerilen grafik: 5 dakika.")
+    if sw_chartSeconds >= sw_confirmSeconds or sw_confirmSeconds >= sw_contextSeconds or sw_contextSeconds >= sw_biasSeconds
+        runtime.error("Grafik TF < Onay TF < HTF < Ana bias TF olmali. Ornek: 5m < 45m < 4H < 1D.")
+    if sw_confirmSeconds % sw_chartSeconds != 0 or sw_contextSeconds % sw_chartSeconds != 0 or sw_biasSeconds % sw_chartSeconds != 0
+        runtime.error("Grafik TF tum secili TF'leri tam bolmeli. Varsayilan D / 4H / 45m icin 5m veya 15m kullanin.")
+    if sw_internalLen >= sw_swingLen
+        runtime.error("Internal pivot uzunlugu, swing pivot uzunlugundan kucuk olmali.")
+
+// Each written function call has independent state in each requested timeframe.
+// Direction follows confirmed structure breaks; HH/HL or LH/LL initializes an unknown state.
+sw_f_structure(int length, float atr) =>
+    float ph = ta.pivothigh(high, length, length)
+    float pl = ta.pivotlow(low, length, length)
+    var float hi = na
+    var float lo = na
+    var float previousHi = na
+    var float previousLo = na
+    var int hiTime = na
+    var int loTime = na
+    var bool hiBroken = false
+    var bool loBroken = false
+    var bool hiSwept = false
+    var bool loSwept = false
+    var int bias = 0
+    int priorBias = bias
+    int structureEvent = 0
+    int sweepSide = 0
+    float sweptLevel = na
+    float sweepExtreme = na
+    float oppositeLevel = na
+    bool ordered = false
+    // Evaluate against levels already known BEFORE this candle's pivot updates.
+    bool upBreak = not na(hi) and not hiBroken and close > hi + sw_breakBuffer * atr
+    bool downBreak = not na(lo) and not loBroken and close < lo - sw_breakBuffer * atr
+    bool ssl = not na(lo) and not loBroken and not loSwept and low < lo - sw_sweepBuffer * atr and close > lo
+    bool bsl = not na(hi) and not hiBroken and not hiSwept and high > hi + sw_sweepBuffer * atr and close < hi
+    if ssl
+        loSwept := true
+    if bsl
+        hiSwept := true
+    if ssl and not bsl
+        sweepSide := 1
+        sweptLevel := lo
+        sweepExtreme := low
+        oppositeLevel := hi
+        ordered := not na(hiTime) and not na(loTime) and loTime < hiTime and hiTime < time
+    if bsl and not ssl
+        sweepSide := -1
+        sweptLevel := hi
+        sweepExtreme := high
+        oppositeLevel := lo
+        ordered := not na(hiTime) and not na(loTime) and hiTime < loTime and loTime < time
+    if upBreak
+        hiBroken := true
+    if downBreak
+        loBroken := true
+    if upBreak and not downBreak
+        structureEvent := priorBias == -1 ? 2 : priorBias == 1 ? 1 : 3
+        bias := 1
+    if downBreak and not upBreak
+        structureEvent := priorBias == 1 ? -2 : priorBias == -1 ? -1 : -3
+        bias := -1
+    if upBreak and downBreak
+        bias := 0
+    if not na(ph)
+        previousHi := hi
+        hi := ph
+        hiTime := time[length]
+        hiBroken := false
+        hiSwept := false
+    if not na(pl)
+        previousLo := lo
+        lo := pl
+        loTime := time[length]
+        loBroken := false
+        loSwept := false
+    if bias == 0 and not na(previousHi) and not na(previousLo)
+        bias := hi > previousHi and lo > previousLo ? 1 : hi < previousHi and lo < previousLo ? -1 : 0
+    [bias, hi, lo, hiBroken, loBroken, structureEvent, sweepSide, sweptLevel, sweepExtreme, oppositeLevel, priorBias, ordered]
+
+type sw_ContextPacket
+    int v0
+    int v1
+    float v2
+    float v3
+    float v4
+    float v5
+    float v6
+    float v7
+    int v8
+    int v9
+    float v10
+    float v11
+    bool v12
+    bool v13
+    float v14
+    float v15
+    int v16
+    int v17
+    int v18
+    float v19
+    float v20
+    int v21
+    float v22
+    float v23
+    float v24
+    int v25
+    bool v26
+    bool v27
+
+sw_f_context() =>
+    float atr = ta.atr(14)
+    [sb, sh, sl, shb, slb, se, ss, sr, sx, so, sp, sq] = sw_f_structure(sw_swingLen, atr)
+    [ib, ih, il, ihb, ilb, ie, iss, ir, ix, io, ip, iq] = sw_f_structure(sw_internalLen, atr)
+    float path = math.sum(math.abs(ta.change(close)), sw_regimeLen)
+    float efficiency = path > 0 ? math.abs(close - close[sw_regimeLen]) / path : 0.0
+    float width = ta.highest(high, sw_regimeLen) - ta.lowest(low, sw_regimeLen)
+    bool compressed = not na(atr) and efficiency <= sw_efficiencyMax and width <= sw_compressionMax * atr
+    // Only confirmed requested candles. Includes source open AND close timestamps.
+    sw_ContextPacket.new(time[1], time_close[1], open[1], high[1], low[1], close[1], close[2], atr[1], sb[1], ib[1], sh[1], sl[1], shb[1], slb[1], ih[1], il[1], se[1], ie[1], ss[1], sr[1], sx[1], iss[1], ir[1], ix[1], io[1], ip[1], iq[1], compressed[1])
+
+sw_ContextPacket sw_dPacket = request.security(syminfo.tickerid, sw_biasTf, sw_f_context(), lookahead = barmerge.lookahead_on)
+int sw_dTime = na(sw_dPacket) ? na : sw_dPacket.v0
+int sw_dEnd = na(sw_dPacket) ? na : sw_dPacket.v1
+float sw_dOpen = na(sw_dPacket) ? na : sw_dPacket.v2
+float sw_dHigh = na(sw_dPacket) ? na : sw_dPacket.v3
+float sw_dLow = na(sw_dPacket) ? na : sw_dPacket.v4
+float sw_dClose = na(sw_dPacket) ? na : sw_dPacket.v5
+float sw_dPreviousClose = na(sw_dPacket) ? na : sw_dPacket.v6
+float sw_dAtr = na(sw_dPacket) ? na : sw_dPacket.v7
+int sw_dSwing = na(sw_dPacket) ? na : sw_dPacket.v8
+int sw_dInternal = na(sw_dPacket) ? na : sw_dPacket.v9
+float sw_dSwingHigh = na(sw_dPacket) ? na : sw_dPacket.v10
+float sw_dSwingLow = na(sw_dPacket) ? na : sw_dPacket.v11
+bool sw_dHighBroken = na(sw_dPacket) ? false : sw_dPacket.v12
+bool sw_dLowBroken = na(sw_dPacket) ? false : sw_dPacket.v13
+float sw_dInternalHigh = na(sw_dPacket) ? na : sw_dPacket.v14
+float sw_dInternalLow = na(sw_dPacket) ? na : sw_dPacket.v15
+int sw_dSwingEvent = na(sw_dPacket) ? na : sw_dPacket.v16
+int sw_dInternalEvent = na(sw_dPacket) ? na : sw_dPacket.v17
+int sw_dSweep = na(sw_dPacket) ? na : sw_dPacket.v18
+float sw_dSweptLevel = na(sw_dPacket) ? na : sw_dPacket.v19
+float sw_dExtreme = na(sw_dPacket) ? na : sw_dPacket.v20
+int sw_dISweep = na(sw_dPacket) ? na : sw_dPacket.v21
+float sw_dIRef = na(sw_dPacket) ? na : sw_dPacket.v22
+float sw_dIX = na(sw_dPacket) ? na : sw_dPacket.v23
+float sw_dIOpposite = na(sw_dPacket) ? na : sw_dPacket.v24
+int sw_dIPrior = na(sw_dPacket) ? na : sw_dPacket.v25
+bool sw_dIOrdered = na(sw_dPacket) ? false : sw_dPacket.v26
+bool sw_dCompressed = na(sw_dPacket) ? false : sw_dPacket.v27
+sw_ContextPacket sw_hPacket = request.security(syminfo.tickerid, sw_contextTf, sw_f_context(), lookahead = barmerge.lookahead_on)
+int sw_hTime = na(sw_hPacket) ? na : sw_hPacket.v0
+int sw_hEnd = na(sw_hPacket) ? na : sw_hPacket.v1
+float sw_hOpen = na(sw_hPacket) ? na : sw_hPacket.v2
+float sw_hHigh = na(sw_hPacket) ? na : sw_hPacket.v3
+float sw_hLow = na(sw_hPacket) ? na : sw_hPacket.v4
+float sw_hClose = na(sw_hPacket) ? na : sw_hPacket.v5
+float sw_hPreviousClose = na(sw_hPacket) ? na : sw_hPacket.v6
+float sw_hAtr = na(sw_hPacket) ? na : sw_hPacket.v7
+int sw_hSwing = na(sw_hPacket) ? na : sw_hPacket.v8
+int sw_hInternal = na(sw_hPacket) ? na : sw_hPacket.v9
+float sw_hSwingHigh = na(sw_hPacket) ? na : sw_hPacket.v10
+float sw_hSwingLow = na(sw_hPacket) ? na : sw_hPacket.v11
+bool sw_hHighBroken = na(sw_hPacket) ? false : sw_hPacket.v12
+bool sw_hLowBroken = na(sw_hPacket) ? false : sw_hPacket.v13
+float sw_hInternalHigh = na(sw_hPacket) ? na : sw_hPacket.v14
+float sw_hInternalLow = na(sw_hPacket) ? na : sw_hPacket.v15
+int sw_hSwingEvent = na(sw_hPacket) ? na : sw_hPacket.v16
+int sw_hInternalEvent = na(sw_hPacket) ? na : sw_hPacket.v17
+int sw_hSweep = na(sw_hPacket) ? na : sw_hPacket.v18
+float sw_hSweptLevel = na(sw_hPacket) ? na : sw_hPacket.v19
+float sw_hExtreme = na(sw_hPacket) ? na : sw_hPacket.v20
+int sw_hISweep = na(sw_hPacket) ? na : sw_hPacket.v21
+float sw_hIRef = na(sw_hPacket) ? na : sw_hPacket.v22
+float sw_hIX = na(sw_hPacket) ? na : sw_hPacket.v23
+float sw_hIOpposite = na(sw_hPacket) ? na : sw_hPacket.v24
+int sw_hIPrior = na(sw_hPacket) ? na : sw_hPacket.v25
+bool sw_hIOrdered = na(sw_hPacket) ? false : sw_hPacket.v26
+bool sw_hCompressed = na(sw_hPacket) ? false : sw_hPacket.v27
+sw_ContextPacket sw_cPacket = request.security(syminfo.tickerid, sw_confirmTf, sw_f_context(), lookahead = barmerge.lookahead_on)
+int sw_cTime = na(sw_cPacket) ? na : sw_cPacket.v0
+int sw_cEnd = na(sw_cPacket) ? na : sw_cPacket.v1
+float sw_cOpen = na(sw_cPacket) ? na : sw_cPacket.v2
+float sw_cHigh = na(sw_cPacket) ? na : sw_cPacket.v3
+float sw_cLow = na(sw_cPacket) ? na : sw_cPacket.v4
+float sw_cClose = na(sw_cPacket) ? na : sw_cPacket.v5
+float sw_cPreviousClose = na(sw_cPacket) ? na : sw_cPacket.v6
+float sw_cAtr = na(sw_cPacket) ? na : sw_cPacket.v7
+int sw_cSwing = na(sw_cPacket) ? na : sw_cPacket.v8
+int sw_cInternal = na(sw_cPacket) ? na : sw_cPacket.v9
+float sw_cSwingHigh = na(sw_cPacket) ? na : sw_cPacket.v10
+float sw_cSwingLow = na(sw_cPacket) ? na : sw_cPacket.v11
+bool sw_cHighBroken = na(sw_cPacket) ? false : sw_cPacket.v12
+bool sw_cLowBroken = na(sw_cPacket) ? false : sw_cPacket.v13
+float sw_cInternalHigh = na(sw_cPacket) ? na : sw_cPacket.v14
+float sw_cInternalLow = na(sw_cPacket) ? na : sw_cPacket.v15
+int sw_cSwingEvent = na(sw_cPacket) ? na : sw_cPacket.v16
+int sw_cInternalEvent = na(sw_cPacket) ? na : sw_cPacket.v17
+int sw_cSweep = na(sw_cPacket) ? na : sw_cPacket.v18
+float sw_cSweptLevel = na(sw_cPacket) ? na : sw_cPacket.v19
+float sw_cExtreme = na(sw_cPacket) ? na : sw_cPacket.v20
+int sw_cISweep = na(sw_cPacket) ? na : sw_cPacket.v21
+float sw_cIRef = na(sw_cPacket) ? na : sw_cPacket.v22
+float sw_cIX = na(sw_cPacket) ? na : sw_cPacket.v23
+float sw_cIOpposite = na(sw_cPacket) ? na : sw_cPacket.v24
+int sw_cIPrior = na(sw_cPacket) ? na : sw_cPacket.v25
+bool sw_cIOrdered = na(sw_cPacket) ? false : sw_cPacket.v26
+bool sw_cCompressed = na(sw_cPacket) ? false : sw_cPacket.v27
+
+bool sw_newD = not na(sw_dTime) and (na(sw_dTime[1]) or sw_dTime != sw_dTime[1])
+bool sw_newH = not na(sw_hTime) and (na(sw_hTime[1]) or sw_hTime != sw_hTime[1])
+bool sw_newC = not na(sw_cTime) and (na(sw_cTime[1]) or sw_cTime != sw_cTime[1])
+bool sw_dataReady = not na(sw_dAtr) and not na(sw_hAtr) and not na(sw_cAtr) and not na(sw_hSwingHigh) and not na(sw_hSwingLow)
+
+// Market regime, structural phase and sweep event are separate facts.
+bool sw_aligned = sw_dSwing != 0 and sw_hSwing == sw_dSwing and sw_cSwing == sw_dSwing
+bool sw_pullback = sw_dSwing != 0 and sw_hSwing == sw_dSwing and (sw_hInternal == -sw_dSwing or sw_cSwing == -sw_dSwing or sw_cInternal == -sw_dSwing)
+bool sw_reversalCandidate = sw_dSwing != 0 and sw_hSwing == -sw_dSwing
+string sw_regimeText = not sw_dataReady ? "Veri bekleniyor" : sw_hCompressed ? "Sikisma adayi" : sw_aligned and not sw_pullback ? "Trend uyumu" : sw_reversalCandidate ? "HTF celiskisi / donus adayi" : sw_pullback ? "Ana trendde duzeltme" : "Karisik"
+
+// Phase: 0 idle, 1 wait for break, 2 wait for retest, 3 first-visit reaction,
+// 4 entry-ready, 5 invalid, 6 expired. A terminal phase is NOT an open position.
+type sw_Setup
+    int side = 0
+    int phase = 0
+    string model = ""
+    string id = ""
+    string reason = "Aday yok"
+    int sweepStart = na
+    int sweepEnd = na
+    int createdBar = na
+    int breakEnd = na
+    int breakBar = na
+    int touchBar = na
+    int terminalBar = na
+    float criticalLevel = na
+    float sweptLevel = na
+    float extreme = na
+    float breakLevel = na
+    float stop = na
+    float bandLow = na
+    float bandHigh = na
+    float confirmAtr = na
+    float target = na
+    float entry = na
+    float rr = na
+    box area = na
+
+var array<sw_Setup> sw_setups = array.from(sw_Setup.new(side = 1), sw_Setup.new(side = -1))
+
+sw_f_bias(int bias) =>
+    bias == 1 ? "Bullish" : bias == -1 ? "Bearish" : "Belirsiz"
+
+sw_f_phase(int phase) =>
+    switch phase
+        1 => "SWEEP / ChoCh bekleniyor"
+        2 => "CHOCH / ilk retest bekleniyor"
+        3 => "TEMAS / tepki bekleniyor"
+        4 => "HAZIR"
+        5 => "IPTAL"
+        6 => "SURE DOLDU"
+        => "Aday yok"
+
+sw_f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+sw_f_event_text(sw_Setup s, string eventName) =>
+    "MPA PB v0.1 | " + eventName + " | " + syminfo.tickerid + " | " + s.model + (s.side == 1 ? " LONG" : " SHORT") + " | id=" + s.id + " | TF=" + sw_biasTf + "/" + sw_contextTf + "/" + sw_confirmTf + "/" + timeframe.period + " | " + s.reason + " | sweep=" + sw_f_price(s.sweptLevel) + " | kirilim=" + sw_f_price(s.breakLevel) + " | stop=" + sw_f_price(s.stop) + " | hedef=" + sw_f_price(s.target) + " | aday giris=" + sw_f_price(s.entry) + " | RR=" + (na(s.rr) ? "-" : str.tostring(s.rr, "#.##"))
+
+sw_f_notice(sw_Setup s, string eventName, bool terminal) =>
+    ""
+
+method sw_finish(sw_Setup s, int phase, string reason) =>
+    s.phase := phase
+    s.reason := reason
+    s.terminalBar := bar_index
+    if not na(s.area)
+        box.set_extend(s.area, extend.none)
+        box.set_right(s.area, time_close)
+
+method sw_start(sw_Setup s, string model, int sourceStart, int sourceEnd, float critical, float swept, float extreme, float threshold, float atr) =>
+    s.phase := 1
+    s.model := model
+    s.id := syminfo.tickerid + ":" + model + ":" + str.tostring(sourceEnd) + ":" + str.tostring(s.side)
+    s.reason := "Sweep teyitli; sonraki onay mumunda yapi kirilimi bekleniyor"
+    s.sweepStart := sourceStart
+    s.sweepEnd := sourceEnd
+    s.createdBar := bar_index
+    s.breakEnd := na
+    s.breakBar := na
+    s.touchBar := na
+    s.criticalLevel := critical
+    s.sweptLevel := swept
+    s.extreme := extreme
+    s.breakLevel := threshold
+    s.stop := extreme - s.side * math.max(sw_stopBuffer * atr, syminfo.mintick)
+    s.bandLow := na
+    s.bandHigh := na
+    s.confirmAtr := na
+    s.target := na
+    s.entry := na
+    s.rr := na
+    s.area := na
+
+// Nearest eligible automatic HTF reference: HTF swing, macro swing, prior macro candle H/L.
+sw_f_critical(int side, float reference) =>
+    float a = side == 1 ? (not sw_hLowBroken ? sw_hSwingLow : na) : (not sw_hHighBroken ? sw_hSwingHigh : na)
+    float b = side == 1 ? (not sw_dLowBroken ? sw_dSwingLow : na) : (not sw_dHighBroken ? sw_dSwingHigh : na)
+    float c = side == 1 ? sw_dLow : sw_dHigh
+    float chosen = na
+    float distance = sw_levelNearAtr * sw_hAtr
+    array<float> levels = array.from(a, b, c)
+    for value in levels
+        if not na(value) and math.abs(reference - value) <= distance
+            chosen := value
+            distance := math.abs(reference - value)
+    chosen
+
+// Freeze target at ChoCh confirmation; no invented fixed-R target to pass the RR filter.
+sw_f_target(int side, float fromPrice) =>
+    float chosen = na
+    array<float> levels = side == 1 ? array.from(not sw_hHighBroken ? sw_hSwingHigh : na, not sw_dHighBroken ? sw_dSwingHigh : na, sw_dHigh) : array.from(not sw_hLowBroken ? sw_hSwingLow : na, not sw_dLowBroken ? sw_dSwingLow : na, sw_dLow)
+    for value in levels
+        if not na(value) and side * (value - fromPrice) > syminfo.mintick
+            if na(chosen) or side * (value - chosen) < 0
+                chosen := value
+    chosen
+
+float sw_longCritical = sw_f_critical(1, sw_cIRef)
+float sw_shortCritical = sw_f_critical(-1, sw_cIRef)
+bool sw_candidate4Long = sw_use4A and sw_newC and sw_cISweep == 1 and sw_cIOrdered and sw_cIPrior == -1 and not na(sw_longCritical) and sw_cClose < sw_cIOpposite
+bool sw_candidate4Short = sw_use4A and sw_newC and sw_cISweep == -1 and sw_cIOrdered and sw_cIPrior == 1 and not na(sw_shortCritical) and sw_cClose > sw_cIOpposite
+bool sw_candidate5Long = sw_use5A and sw_newH and sw_hSweep == 1 and sw_cInternal == -1 and not na(sw_cInternalHigh) and sw_cClose < sw_cInternalHigh
+bool sw_candidate5Short = sw_use5A and sw_newH and sw_hSweep == -1 and sw_cInternal == 1 and not na(sw_cInternalLow) and sw_cClose > sw_cInternalLow
+bool sw_conflictingCandidates = (sw_candidate4Long or sw_candidate5Long) and (sw_candidate4Short or sw_candidate5Short)
+
+bool sw_readyLong = false
+bool sw_readyShort = false
+bool sw_cancelled = false
+bool sw_expired = false
+string sw_messages = ""
+if barstate.isconfirmed and sw_dataReady
+    for index = 0 to array.size(sw_setups) - 1
+        sw_Setup s = array.get(sw_setups, index)
+        bool active = s.phase >= 1 and s.phase <= 3
+        if active and bar_index > s.createdBar
+            // Conservative precedence: invalidation / elapsed time / target already hit,
+            // then confirmation. Intrabar ordering is never inferred from one OHLC candle.
+            bool invalidExtreme = s.side == 1 ? low < s.extreme : high > s.extreme
+            bool invalidContext = sw_newH and sw_hTime >= s.sweepEnd and (s.side == 1 ? sw_hClose < s.criticalLevel : sw_hClose > s.criticalLevel)
+            bool invalidBias = sw_biasPolicy == "Yalniz ana bias yonu" and sw_dSwing != s.side
+            int deadline = s.phase == 1 ? s.sweepEnd + int(sw_confirmWait * sw_confirmSeconds * 1000) : s.breakEnd + int(sw_retestWait * sw_confirmSeconds * 1000)
+            // A source candle ending exactly at the deadline is still an on-time event,
+            // even though its confirmed packet is observed on the next chart candle.
+            bool onTimeConfirmation = s.phase == 1 and sw_newC and sw_cTime >= s.sweepEnd and sw_cEnd <= deadline
+            bool timedOut = time_close > deadline and not onTimeConfirmation
+            bool targetReached = s.phase >= 2 and not na(s.target) and (s.side == 1 ? high >= s.target : low <= s.target)
+            if invalidExtreme or invalidContext or invalidBias
+                s.sw_finish(5, invalidExtreme ? "Sweep ucu yeniden ihlal edildi" : invalidContext ? "HTF kritik seviyenin gecersiz tarafinda kapandi" : "Ana bias filtresi bozuldu")
+                sw_messages += sw_f_notice(s, "IPTAL", true)
+                sw_cancelled := true
+            else if timedOut
+                s.sw_finish(6, s.phase == 1 ? "ChoCh bekleme suresi doldu" : "Retest bekleme suresi doldu")
+                sw_messages += sw_f_notice(s, "SURE DOLDU", true)
+                sw_expired := true
+            else if targetReached
+                s.sw_finish(5, "Ilk giris onayindan once hedefe ulasildi")
+                sw_messages += sw_f_notice(s, "IPTAL", true)
+                sw_cancelled := true
+            else
+                if s.phase == 1 and sw_newC and sw_cTime >= s.sweepEnd
+                    float candleRange = math.max(sw_cHigh - sw_cLow, syminfo.mintick)
+                    bool displaced = math.abs(sw_cClose - sw_cOpen) / candleRange >= sw_displacementBody and candleRange >= sw_displacementRange * sw_cAtr
+                    bool crossed = s.side == 1 ? sw_cPreviousClose <= s.breakLevel and sw_cClose > s.breakLevel : sw_cPreviousClose >= s.breakLevel and sw_cClose < s.breakLevel
+                    bool directional = s.side * (sw_cClose - sw_cOpen) > 0
+                    bool away = s.side * (sw_cClose - s.breakLevel) >= sw_displacementClose * sw_cAtr
+                    if crossed
+                        if displaced and directional and away
+                            s.phase := 2
+                            s.breakEnd := sw_cEnd
+                            s.breakBar := bar_index
+                            s.confirmAtr := sw_cAtr
+                            s.bandLow := s.breakLevel - sw_retestHalfWidth * sw_cAtr
+                            s.bandHigh := s.breakLevel + sw_retestHalfWidth * sw_cAtr
+                            s.target := sw_f_target(s.side, sw_cClose)
+                            s.reason := "Govdeli kirilim teyitli; ilk retest bekleniyor"
+                            if na(s.target)
+                                s.sw_finish(5, "Kirilim otesinde uygun yapisal hedef yok")
+                                sw_messages += sw_f_notice(s, "IPTAL", true)
+                                sw_cancelled := true
+                            else
+                                if sw_showSetup
+                                    color ink = s.side == 1 ? color.teal : color.orange
+                                    s.area := box.new(left = time, top = s.bandHigh, right = time_close, bottom = s.bandLow, xloc = xloc.bar_time, extend = extend.right, border_color = ink, bgcolor = color.new(ink, 88), text = s.model + " retest", text_size = size.tiny, text_color = ink)
+                                sw_messages += sw_f_notice(s, "CHOCH", false)
+                        else
+                            s.sw_finish(5, "Ilk esik kirilimi displacement kosullarini karsilamadi")
+                            sw_messages += sw_f_notice(s, "IPTAL", true)
+                            sw_cancelled := true
+                // A newly imported break was known at this chart candle's OPEN. The first
+                // post-break chart candle can be a valid retest; source timestamps decide.
+                bool targetHitAfterImport = s.phase == 2 and not na(s.target) and (s.side == 1 ? high >= s.target : low <= s.target)
+                if targetHitAfterImport
+                    s.sw_finish(5, "Kirilim bildirimi islenirken hedefe zaten ulasildi")
+                    sw_messages += sw_f_notice(s, "IPTAL", true)
+                    sw_cancelled := true
+                if s.phase == 2 and time >= s.breakEnd
+                    bool touched = high >= s.bandLow and low <= s.bandHigh
+                    bool tooFar = s.side == 1 ? close > s.bandHigh + sw_maximumChase * s.confirmAtr : close < s.bandLow - sw_maximumChase * s.confirmAtr
+                    if touched
+                        s.phase := 3
+                        s.touchBar := bar_index
+                        s.reason := "Ilk retest temasi; grafik mumunda tepki bekleniyor"
+                        sw_messages += sw_f_notice(s, "RETEST", false)
+                    else if tooFar
+                        // Distance alone before a pullback is not an invalidation.
+                        s.reason := "Fiyat banttan uzakta; geri donus bekleniyor"
+                if s.phase == 3
+                    bool held = s.side == 1 ? close > s.breakLevel : close < s.breakLevel
+                    bool reaction = not sw_requireCandleDirection or s.side * (close - open) > 0
+                    bool chase = s.side == 1 ? close > s.bandHigh + sw_maximumChase * s.confirmAtr : close < s.bandLow - sw_maximumChase * s.confirmAtr
+                    bool lostBand = s.side == 1 ? close < s.bandLow : close > s.bandHigh
+                    bool reactionExpired = bar_index - s.touchBar >= sw_reactionBars
+                    if lostBand or chase or reactionExpired
+                        bool onlyExpired = reactionExpired and not lostBand and not chase
+                        s.sw_finish(onlyExpired ? 6 : 5, lostBand ? "Ilk retest bandi kapanisla kaybedildi" : chase ? "Tepki kapanisi giris bandindan fazla uzaklasti" : "Ilk temas sonrasi tepki gelmedi")
+                        sw_messages += sw_f_notice(s, onlyExpired ? "SURE DOLDU" : "IPTAL", true)
+                        sw_cancelled := sw_cancelled or not onlyExpired
+                        sw_expired := sw_expired or onlyExpired
+                    else if held and reaction
+                        s.entry := close
+                        float riskDistance = s.side * (s.entry - s.stop)
+                        float rewardDistance = s.side * (s.target - s.entry)
+                        s.rr := riskDistance > 0 ? rewardDistance / riskDistance : na
+                        if not na(s.rr) and s.rr >= sw_minimumRR
+                            s.sw_finish(4, "Ilk retest tepkisi ve planlanan RR uygun; manuel degerlendirme")
+                            sw_messages += sw_f_notice(s, "HAZIR", false)
+                            sw_readyLong := sw_readyLong or s.side == 1
+                            sw_readyShort := sw_readyShort or s.side == -1
+                        else
+                            s.sw_finish(5, "Ilk retestte planlanan RR yetersiz")
+                            sw_messages += sw_f_notice(s, "IPTAL", true)
+                            sw_cancelled := true
+
+        // One active candidate per direction. Existing candidates retain their frozen levels.
+        bool available = (s.phase == 0 or s.phase >= 4) and (na(s.terminalBar) or bar_index - s.terminalBar >= sw_cooldownBars)
+        bool allowedSide = s.side == 1 ? sw_directionInput != "Short" : sw_directionInput != "Long"
+        bool allowedBias = sw_biasPolicy == "Ters yone izin ver" or sw_dSwing == s.side
+        if available and allowedSide and allowedBias and not sw_conflictingCandidates
+            bool route5 = s.side == 1 ? sw_candidate5Long : sw_candidate5Short
+            bool route4 = s.side == 1 ? sw_candidate4Long : sw_candidate4Short
+            if route5
+                float threshold = s.side == 1 ? sw_cInternalHigh : sw_cInternalLow
+                bool survived = s.side == 1 ? low >= sw_hExtreme : high <= sw_hExtreme
+                if survived
+                    s.sw_start("5A", sw_hTime, sw_hEnd, sw_hSweptLevel, sw_hSweptLevel, sw_hExtreme, threshold, sw_hAtr)
+                    sw_messages += sw_f_notice(s, "SWEEP", false)
+            else if route4
+                bool survived = s.side == 1 ? low >= sw_cIX : high <= sw_cIX
+                if survived
+                    s.sw_start("4A", sw_cTime, sw_cEnd, s.side == 1 ? sw_longCritical : sw_shortCritical, sw_cIRef, sw_cIX, sw_cIOpposite, sw_cAtr)
+                    sw_messages += sw_f_notice(s, "SWEEP", false)
+    if sw_notifyBias and sw_newD and not na(sw_dSwing[1]) and sw_dSwing != sw_dSwing[1]
+        sw_messages += "MPA PB v0.1 | ANA BIAS | " + syminfo.tickerid + " | " + sw_biasTf + " " + sw_f_bias(sw_dSwing) + "\n"
+
+sw_Setup sw_longSetup = array.get(sw_setups, 0)
+sw_Setup sw_shortSetup = array.get(sw_setups, 1)
+
+// ==================== pa_htf_pullback.pine ====================
+
+// Standalone alert indicator. See pullback_range.md for definitions and limitations.
+string pb_biasTf = monBiasTf
+string pb_zoneTf = monZoneTf
+string pb_confirmTf = monConfirmTf
+int pb_swingLen = 5
+int pb_internalLen = 2
+int pb_triggerLen = 2
+float pb_breakBuffer = 0.05
+
+int pb_originLookback = 20
+float pb_impulseMin = 1.5
+float pb_bosBodyMin = 0.50
+int pb_maxVisits = 2
+int pb_rearmBars = 3
+int pb_zoneLife = 60
+bool pb_rejectInsideClose = true
+string pb_retracementMode = "Discount / premium"
+string pb_directionInput = monDirection
+
+int pb_chochWait = 8
+int pb_hlWait = 24
+float pb_chochBodyMin = 0.50
+float pb_stopBuffer = 0.05
+float pb_minimumRR = monMinRR
+int pb_cooldownBars = 12
+string pb_notifyMode = "Sadece hazir"
+bool pb_showZones = monShowZones
+bool pb_showLabels = false
+
+float pb_chartSeconds = timeframe.in_seconds()
+float pb_zoneSeconds = timeframe.in_seconds(pb_zoneTf)
+float pb_confirmSeconds = timeframe.in_seconds(pb_confirmTf)
+float pb_biasSeconds = timeframe.in_seconds(pb_biasTf)
+if barstate.isfirst
+    if not chart.is_standard or not timeframe.isintraday
+        runtime.error("Standart intraday mum kullanin. Varsayilan tetik grafigi 5m.")
+    if pb_chartSeconds >= pb_confirmSeconds or pb_confirmSeconds >= pb_zoneSeconds or pb_zoneSeconds >= pb_biasSeconds
+        runtime.error("Grafik < ChoCh TF < Bolge TF < Ana trend TF olmali.")
+    if pb_confirmSeconds % pb_chartSeconds != 0 or pb_zoneSeconds % pb_chartSeconds != 0 or pb_biasSeconds % pb_chartSeconds != 0
+        runtime.error("Grafik TF secili tum TF'leri tam bolmeli. Varsayilanlarla 5m veya 15m kullanin.")
+
+// The break uses levels known before this source bar's newly confirmed pivots.
+pb_f_structure(int length, float atr) =>
+    float ph = ta.pivothigh(high, length, length)
+    float pl = ta.pivotlow(low, length, length)
+    var float hi = na
+    var float lo = na
+    var float previousHi = na
+    var float previousLo = na
+    var int hiTime = na
+    var int loTime = na
+    var bool hiBroken = false
+    var bool loBroken = false
+    var int bias = 0
+    float anchorHi = hi
+    float anchorLo = lo
+    int anchorHiTime = hiTime
+    int anchorLoTime = loTime
+    bool up = not na(hi) and not hiBroken and close > hi + pb_breakBuffer * atr
+    bool down = not na(lo) and not loBroken and close < lo - pb_breakBuffer * atr
+    int event = 0
+    if up and not down
+        event := bias == 1 ? 1 : bias == -1 ? 2 : 3
+        bias := 1
+    if down and not up
+        event := bias == -1 ? -1 : bias == 1 ? -2 : -3
+        bias := -1
+    if up
+        hiBroken := true
+    if down
+        loBroken := true
+    if not na(ph)
+        previousHi := hi
+        hi := ph
+        hiTime := time[length]
+        hiBroken := close > hi
+    if not na(pl)
+        previousLo := lo
+        lo := pl
+        loTime := time[length]
+        loBroken := close < lo
+    if bias == 0 and not na(previousHi) and not na(previousLo)
+        bias := hi > previousHi and lo > previousLo ? 1 : hi < previousHi and lo < previousLo ? -1 : 0
+    [bias, hi, lo, hiBroken, loBroken, event, anchorHi, anchorLo, anchorHiTime, anchorLoTime]
+
+pb_f_bias_packet(int length) =>
+    float atr = ta.atr(14)
+    [b, hi, lo, hb, lb, ev, ah, al, aht, alt] = pb_f_structure(length, atr)
+    [time[1], time_close[1], open[1], high[1], low[1], close[1], close[2], atr[1], b[1], hi[1], lo[1], hb[1], lb[1]]
+
+pb_f_zone_packet() =>
+    float atr = ta.atr(14)
+    [b, hi, lo, hb, lb, ev, ah, al, aht, alt] = pb_f_structure(pb_swingLen, atr)
+    int side = ev == 1 ? 1 : ev == -1 ? -1 : 0
+    float bottom = na
+    float top = na
+    float impulseLow = side == 1 ? al : low
+    float impulseHigh = side == 1 ? high : ah
+    int origin = na
+    float bodyRatio = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+    bool valid = side != 0 and bodyRatio >= pb_bosBodyMin and (close - open) * side > 0 and impulseHigh - impulseLow >= pb_impulseMin * atr
+    if valid
+        for i = 1 to pb_originLookback
+            bool opposite = side == 1 ? close[i] < open[i] : close[i] > open[i]
+            bool afterAnchor = side == 1 ? time[i] >= alt : time[i] >= aht
+            if opposite and afterAnchor
+                bottom := low[i]
+                top := high[i]
+                origin := i
+                break
+        valid := not na(origin)
+    // Reject origins already revisited on HTF bars after an HTF close left the zone.
+    // The departure candle itself is formation, not a retest. No hidden LTF history is inferred.
+    if valid
+        bool departed = false
+        bool revisited = false
+        bool lost = false
+        for i = origin - 1 to 0
+            if departed and low[i] <= top and high[i] >= bottom
+                revisited := true
+            if (side == 1 and close[i] < bottom) or (side == -1 and close[i] > top)
+                lost := true
+            if (side == 1 and close[i] > top) or (side == -1 and close[i] < bottom)
+                departed := true
+        valid := departed and not revisited and not lost and bottom >= impulseLow and top <= impulseHigh
+    int zoneSide = valid ? side : 0
+    [time[1], time_close[1], close[1], atr[1], b[1], zoneSide[1], bottom[1], top[1], impulseLow[1], impulseHigh[1]]
+
+[pb_dTime, pb_dEnd, pb_dOpen, pb_dHigh, pb_dLow, pb_dClose, pb_dPrev, pb_dAtr, pb_dBias, pb_dHi, pb_dLo, pb_dHB, pb_dLB] = request.security(syminfo.tickerid, pb_biasTf, pb_f_bias_packet(pb_swingLen), lookahead = barmerge.lookahead_on)
+[pb_hTime, pb_hEnd, pb_hClose, pb_hAtr, pb_hBias, pb_hZoneSide, pb_hBottom, pb_hTop, pb_hImpulseLow, pb_hImpulseHigh] = request.security(syminfo.tickerid, pb_zoneTf, pb_f_zone_packet(), lookahead = barmerge.lookahead_on)
+[pb_cTime, pb_cEnd, pb_cOpen, pb_cHigh, pb_cLow, pb_cClose, pb_cPrev, pb_cAtr, pb_cBias, pb_cHi, pb_cLo, pb_cHB, pb_cLB] = request.security(syminfo.tickerid, pb_confirmTf, pb_f_bias_packet(pb_internalLen), lookahead = barmerge.lookahead_on)
+bool pb_newH = not na(pb_hTime) and (na(pb_hTime[1]) or pb_hTime != pb_hTime[1])
+bool pb_newC = not na(pb_cTime) and (na(pb_cTime[1]) or pb_cTime != pb_cTime[1])
+float pb_triggerLow = ta.pivotlow(low, pb_triggerLen, pb_triggerLen)
+float pb_triggerHigh = ta.pivothigh(high, pb_triggerLen, pb_triggerLen)
+
+type pb_Zone
+    int side = 0
+    int sourceEnd = na
+    float bottom = na
+    float top = na
+    float impulseLow = na
+    float impulseHigh = na
+    float atr = na
+    int visits = 0
+    int awayBars = 0
+    bool visitOpen = false
+    bool alive = false
+    bool used = false
+    box area = na
+
+type pb_Setup
+    int side = 0
+    int phase = 0
+    string id = ""
+    string reason = "Temas bekleniyor"
+    int createdBar = na
+    int touchEnd = na
+    int breakEnd = na
+    int breakBar = na
+    int terminalBar = na
+    float bottom = na
+    float top = na
+    float fibLow = na
+    float fibHigh = na
+    float breakLevel = na
+    float pullbackExtreme = na
+    float stop = na
+    float target = na
+    float entry = na
+    float rr = na
+
+var array<pb_Zone> pb_zones = array.from(pb_Zone.new(side = 1), pb_Zone.new(side = -1))
+var array<pb_Setup> pb_setups = array.from(pb_Setup.new(side = 1), pb_Setup.new(side = -1))
+pb_f_price(float v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+pb_f_bias(int b) =>
+    b == 1 ? "Bullish" : b == -1 ? "Bearish" : "Belirsiz"
+pb_f_phase(int p) =>
+    p == 1 ? "ChoCh " + pb_confirmTf + " bekliyor" : p == 2 ? "HL/LH bekliyor" : p == 3 ? "HAZIR" : p == 4 ? "IPTAL" : p == 5 ? "SURE DOLDU" : "Temas bekliyor"
+method pb_finish(pb_Setup s, int phase, string reason) =>
+    s.phase := phase
+    s.reason := reason
+    s.terminalBar := bar_index
+pb_f_notice(pb_Setup s, string event) =>
+    ""
+
+bool pb_readyLong = false
+bool pb_readyShort = false
+bool pb_cancelled = false
+bool pb_expired = false
+string pb_messages = ""
+if barstate.isconfirmed
+    for idx = 0 to 1
+        pb_Zone z = array.get(pb_zones, idx)
+        pb_Setup s = array.get(pb_setups, idx)
+        int side = s.side
+        // A setup owns its snapshot; replacing the latest zone cannot move an active setup.
+        if pb_newH and pb_hZoneSide == side
+            if not na(z.area)
+                box.set_extend(z.area, extend.none)
+                box.set_right(z.area, time)
+            z.sourceEnd := pb_hEnd
+            z.bottom := pb_hBottom
+            z.top := pb_hTop
+            z.impulseLow := pb_hImpulseLow
+            z.impulseHigh := pb_hImpulseHigh
+            z.atr := pb_hAtr
+            z.visits := 0
+            z.awayBars := pb_rearmBars
+            z.visitOpen := false
+            z.alive := true
+            z.used := false
+            if pb_showZones
+                z.area := box.new(left = time, top = z.top, right = time_close, bottom = z.bottom, xloc = xloc.bar_time, extend = extend.right, border_color = side == 1 ? color.teal : color.orange, bgcolor = color.new(side == 1 ? color.teal : color.orange, 88))
+        if z.alive
+            float invalidLevel = side == 1 ? (pb_rejectInsideClose ? z.top : z.bottom) : (pb_rejectInsideClose ? z.bottom : z.top)
+            bool closeLost = pb_newH and pb_hEnd > z.sourceEnd and (side == 1 ? pb_hClose <= invalidLevel : pb_hClose >= invalidLevel)
+            bool tooOld = time_close > z.sourceEnd + pb_zoneLife * pb_zoneSeconds * 1000
+            if closeLost or tooOld
+                z.alive := false
+                if not na(z.area)
+                    box.set_extend(z.area, extend.none)
+                    box.set_right(z.area, time_close)
+                    box.set_bgcolor(z.area, color.new(color.gray, 94))
+
+        if s.phase == 1 or s.phase == 2
+            float invalidLevel = side == 1 ? (pb_rejectInsideClose ? s.top : s.bottom) : (pb_rejectInsideClose ? s.bottom : s.top)
+            bool closeLost = pb_newH and pb_hEnd >= s.touchEnd and (side == 1 ? pb_hClose <= invalidLevel : pb_hClose >= invalidLevel)
+            bool distalLost = side == 1 ? low < s.bottom : high > s.top
+            bool trendLost = pb_dBias != side or pb_hBias != side
+            bool targetHit = side == 1 ? high >= s.target : low <= s.target
+            bool baselineLost = s.phase == 2 and (side == 1 ? low < s.pullbackExtreme : high > s.pullbackExtreme)
+            int deadline = s.touchEnd + int(pb_chochWait * pb_confirmSeconds * 1000)
+            bool timelyPacket = s.phase == 1 and pb_newC and pb_cTime >= s.touchEnd and pb_cEnd <= deadline
+            bool timedOut = s.phase == 1 ? time_close > deadline and not timelyPacket : bar_index - s.breakBar > pb_hlWait
+            if closeLost or distalLost or trendLost or targetHit or baselineLost
+                s.pb_finish(4, closeLost ? "HTF bolge kapanisi kaybedildi" : distalLost ? "Bolge distal ucu ihlal edildi" : trendLost ? "Daily / HTF trend uyumu bozuldu" : targetHit ? "Giris oncesinde hedefe ulasildi" : "ChoCh sonrasi pullback ucu kaybedildi")
+                pb_cancelled := true
+                pb_messages += pb_f_notice(s, "IPTAL")
+            else if timedOut
+                s.pb_finish(5, s.phase == 1 ? "ChoCh bekleme suresi doldu" : "HL / LH bekleme suresi doldu")
+                pb_expired := true
+                pb_messages += pb_f_notice(s, "SURE DOLDU")
+            else
+                bool cross = s.phase == 1 and pb_newC and pb_cTime >= s.touchEnd and pb_cEnd <= deadline and (side == 1 ? pb_cClose > s.breakLevel and pb_cPrev <= s.breakLevel : pb_cClose < s.breakLevel and pb_cPrev >= s.breakLevel)
+                if s.phase == 1 and not cross
+                    s.pullbackExtreme := side == 1 ? math.min(s.pullbackExtreme, low) : math.max(s.pullbackExtreme, high)
+                if cross
+                    float body = math.abs(pb_cClose - pb_cOpen) / math.max(pb_cHigh - pb_cLow, syminfo.mintick)
+                    bool strong = (pb_cClose - pb_cOpen) * side > 0 and body >= pb_chochBodyMin and (pb_cClose - s.breakLevel) * side >= pb_breakBuffer * pb_cAtr
+                    if strong
+                        s.phase := 2
+                        s.breakEnd := pb_cEnd
+                        s.breakBar := bar_index
+                        s.reason := "Sabit karsi yapi seviyesi kazanildi; yeni HL / LH bekleniyor"
+                        pb_messages += pb_f_notice(s, "CHOCH")
+                    else
+                        s.pb_finish(4, "Ilk ChoCh gecisi govde / kapanis payini saglamadi")
+                        pb_cancelled := true
+                        pb_messages += pb_f_notice(s, "IPTAL")
+                // A pivot is actionable on its confirmation bar, never on its historical origin bar.
+                if s.phase == 2
+                    float pivot = side == 1 ? pb_triggerLow : pb_triggerHigh
+                    bool laterPivot = not na(pivot) and time[pb_triggerLen] >= s.breakEnd
+                    bool postBreakLost = time >= s.breakEnd and (side == 1 ? low < s.pullbackExtreme : high > s.pullbackExtreme)
+                    if postBreakLost
+                        s.pb_finish(4, "ChoCh teyidinin alindigi mumda pullback ucu kaybedildi")
+                        pb_cancelled := true
+                        pb_messages += pb_f_notice(s, "IPTAL")
+                    else if laterPivot
+                        bool higherLower = (pivot - s.pullbackExtreme) * side > 0
+                        float risk = (close - s.stop) * side
+                        float reward = (s.target - close) * side
+                        s.entry := close
+                        s.rr := risk > 0 ? reward / risk : na
+                        if higherLower and (close - pivot) * side > 0 and reward > 0 and risk > 0 and s.rr >= pb_minimumRR
+                            s.pb_finish(3, side == 1 ? "ChoCh sonrasi ilk HL teyit edildi" : "ChoCh sonrasi ilk LH teyit edildi")
+                            pb_readyLong := pb_readyLong or side == 1
+                            pb_readyShort := pb_readyShort or side == -1
+                            pb_messages += pb_f_notice(s, "HAZIR")
+                        else
+                            s.pb_finish(4, not higherLower ? "Ilk pivot HL / LH degil" : "HL / LH teyidinde giris veya R/R uygun degil")
+                            pb_cancelled := true
+                            pb_messages += pb_f_notice(s, "IPTAL")
+
+        if z.alive
+            bool zoneTouch = low <= z.top and high >= z.bottom
+            bool closedAway = side == 1 ? close > z.top : close < z.bottom
+            bool newVisit = zoneTouch and not z.visitOpen
+            if newVisit
+                z.visits += 1
+                z.visitOpen := true
+                z.awayBars := 0
+            if z.visitOpen
+                z.awayBars := closedAway and not zoneTouch ? z.awayBars + 1 : 0
+                if z.awayBars >= pb_rearmBars
+                    z.visitOpen := false
+            float width = z.impulseHigh - z.impulseLow
+            float eq = (z.impulseHigh + z.impulseLow) / 2
+            float fibLow = pb_retracementMode == "Yalniz OTE" ? (side == 1 ? z.impulseHigh - 0.786 * width : z.impulseLow + 0.618 * width) : (side == 1 ? z.impulseLow : eq)
+            float fibHigh = pb_retracementMode == "Yalniz OTE" ? (side == 1 ? z.impulseHigh - 0.618 * width : z.impulseLow + 0.786 * width) : (side == 1 ? eq : z.impulseHigh)
+            float overlapLow = math.max(z.bottom, fibLow)
+            float overlapHigh = math.min(z.top, fibHigh)
+            bool overlapTouch = overlapHigh > overlapLow and low <= overlapHigh and high >= overlapLow
+            bool available = s.phase == 0 or (s.phase >= 3 and bar_index - s.terminalBar >= pb_cooldownBars)
+            bool directionOK = pb_directionInput == "Iki yon" or (side == 1 and pb_directionInput == "Long") or (side == -1 and pb_directionInput == "Short")
+            float reference = side == 1 ? pb_cHi : pb_cLo
+            bool intactReference = side == 1 ? not pb_cHB : not pb_cLB
+            bool notPassed = side == 1 ? close < reference and pb_cClose < reference : close > reference and pb_cClose > reference
+            bool distalHeld = side == 1 ? low >= z.bottom : high <= z.top
+            bool targetUntouched = side == 1 ? high < z.impulseHigh : low > z.impulseLow
+            bool readyData = not na(pb_cAtr) and not na(pb_dAtr) and not na(reference)
+            // Qualifying contact can occur later within the same visit, but never after its quota.
+            if mon1A and available and not z.used and z.visits <= pb_maxVisits and overlapTouch and directionOK and readyData and pb_dBias == side and pb_hBias == side and pb_cBias == -side and intactReference and notPassed and distalHeld and targetUntouched
+                z.used := true
+                s.phase := 1
+                s.id := "1A-" + str.tostring(z.sourceEnd) + "-" + str.tostring(side) + "-" + str.tostring(time_close)
+                s.reason := "HTF bolge + " + pb_retracementMode + " temasi; ChoCh bekleniyor"
+                s.createdBar := bar_index
+                s.touchEnd := time_close
+                s.breakEnd := na
+                s.breakBar := na
+                s.bottom := z.bottom
+                s.top := z.top
+                s.fibLow := overlapLow
+                s.fibHigh := overlapHigh
+                s.breakLevel := reference
+                s.pullbackExtreme := side == 1 ? low : high
+                s.stop := (side == 1 ? z.bottom : z.top) - side * math.max(z.atr * pb_stopBuffer, syminfo.mintick)
+                s.target := side == 1 ? z.impulseHigh : z.impulseLow
+                s.entry := na
+                s.rr := na
+                pb_messages += pb_f_notice(s, "TEMAS")
+
+
+pb_Setup pb_longSetup = array.get(pb_setups, 0)
+pb_Setup pb_shortSetup = array.get(pb_setups, 1)
+
+// ==================== pa_range_setups.pine ====================
+
+// One excursion, one route: single candle = 3C; outside close then return = 3A.
+// Fixed ranges, confirmed source data. Definitions and HTF delay: pullback_range.md.
+string rg_rangeTf = monZoneTf
+int rg_rangeWindow = 48
+int rg_rangePivot = 2
+int rg_minimumTouches = 3
+int rg_touchSpacing = 4
+int rg_minimumSpan = 16
+float rg_touchTolerance = 0.20
+float rg_minimumWidth = 2.0
+float rg_maximumWidth = 10.0
+int rg_rangeLife = 180
+int rg_rediscoveryWait = 4
+
+bool rg_use3A = mon3A
+bool rg_use3C = mon3C
+string rg_directionInput = monDirection
+bool rg_waitHtfClose = true
+int rg_internalLen = 2
+float rg_sweepMinimum = 0.10
+float rg_breakBuffer = 0.05
+float rg_breakBody = 0.50
+float rg_breakRange = 0.50
+int rg_returnWait = 12
+int rg_chochWait = 24
+int rg_retestWait = 24
+int rg_reactionBars = 3
+float rg_retestHalfWidth = 0.10
+float rg_maximumChase = 0.50
+int rg_cooldownBars = 12
+
+float rg_stopBuffer = 0.10
+string rg_rrTarget = "EQ"
+float rg_minimumRR = monMinRR
+string rg_notifyMode = "Sadece hazir"
+bool rg_showRange = monShowZones
+bool rg_showLabels = false
+
+float rg_chartSeconds = timeframe.in_seconds()
+float rg_rangeSeconds = timeframe.in_seconds(rg_rangeTf)
+if barstate.isfirst
+    if not chart.is_standard or not timeframe.isintraday
+        runtime.error("Standart intraday mum kullanin. Setup TF grafik TF'dir; onerilen 5m veya 15m.")
+    if rg_chartSeconds >= rg_rangeSeconds or rg_rangeSeconds % rg_chartSeconds != 0
+        runtime.error("Grafik TF, range TF'den kucuk olmali ve onu tam bolmeli.")
+    if rg_maximumWidth <= rg_minimumWidth or rg_rangeWindow <= rg_minimumSpan + rg_rangePivot * 2
+        runtime.error("Range genisligi / pencere ayarlarini kontrol edin.")
+rg_f_range_packet() =>
+    float rg_atr = ta.atr(14)
+    float ph = ta.pivothigh(high, rg_rangePivot, rg_rangePivot)
+    float pl = ta.pivotlow(low, rg_rangePivot, rg_rangePivot)
+    // Exclude the current source candle. Once accepted, these levels never roll.
+    float candidateHigh = ta.highest(high[1], rg_rangeWindow)
+    float candidateLow = ta.lowest(low[1], rg_rangeWindow)
+    float tolerance = rg_touchTolerance * rg_atr[1]
+    var bool alive = false
+    var int rangeId = na
+    var int bornBar = na
+    var int endedBar = na
+    var float rh = na
+    var float rl = na
+    var int highTouches = 0
+    var int lowTouches = 0
+    var string status = "Yeterli temas bekleniyor"
+    if alive
+        if close < rl or close > rh
+            alive := false
+            endedBar := bar_index
+            status := "HTF range disinda kapandi"
+        else if bar_index - bornBar > rg_rangeLife
+            alive := false
+            endedBar := bar_index
+            status := "Range omru doldu"
+    bool canDiscover = not alive and (na(endedBar) or bar_index - endedBar >= rg_rediscoveryWait)
+    float widthAtr = (candidateHigh - candidateLow) / rg_atr[1]
+    if canDiscover and bar_index >= rg_rangeWindow + rg_rangePivot and widthAtr >= rg_minimumWidth and widthAtr <= rg_maximumWidth and close > candidateLow and close < candidateHigh
+        int highs = 0
+        int lows = 0
+        int newestHigh = na
+        int oldestHigh = na
+        int newestLow = na
+        int oldestLow = na
+        int lastHigh = na
+        int lastLow = na
+        for i = 1 to rg_rangeWindow - rg_rangePivot
+            int offset = i + rg_rangePivot
+            if not na(ph[i]) and math.abs(ph[i] - candidateHigh) <= tolerance and (na(lastHigh) or offset - lastHigh >= rg_touchSpacing)
+                highs += 1
+                newestHigh := na(newestHigh) ? offset : newestHigh
+                oldestHigh := offset
+                lastHigh := offset
+            if not na(pl[i]) and math.abs(pl[i] - candidateLow) <= tolerance and (na(lastLow) or offset - lastLow >= rg_touchSpacing)
+                lows += 1
+                newestLow := na(newestLow) ? offset : newestLow
+                oldestLow := offset
+                lastLow := offset
+        bool durationOK = not na(oldestHigh) and not na(oldestLow) and oldestHigh - newestHigh >= rg_minimumSpan and oldestLow - newestLow >= rg_minimumSpan
+        if highs >= rg_minimumTouches and lows >= rg_minimumTouches and durationOK
+            alive := true
+            rangeId := time_close
+            bornBar := bar_index
+            rh := candidateHigh
+            rl := candidateLow
+            highTouches := highs
+            lowTouches := lows
+            status := "Sabit range aktif"
+    int age = na(bornBar) ? 0 : bar_index - bornBar
+    [time[1], time_close[1], close[1], rg_atr[1], rangeId[1], alive[1], rh[1], rl[1], highTouches[1], lowTouches[1], age[1], status[1]]
+
+[rg_hTime, rg_hEnd, rg_hClose, rg_hAtr, rg_hId, rg_hAlive, rg_hRH, rg_hRL, rg_hHighTouches, rg_hLowTouches, rg_hAge, rg_hStatus] = request.security(syminfo.tickerid, rg_rangeTf, rg_f_range_packet(), lookahead = barmerge.lookahead_on)
+bool rg_newH = not na(rg_hTime) and (na(rg_hTime[1]) or rg_hTime != rg_hTime[1])
+float rg_atr = ta.atr(14)
+int rg_containingHtfEnd = time_close(rg_rangeTf)
+
+rg_f_structure() =>
+    float ph = ta.pivothigh(high, rg_internalLen, rg_internalLen)
+    float pl = ta.pivotlow(low, rg_internalLen, rg_internalLen)
+    var float hi = na
+    var float lo = na
+    var float oldHi = na
+    var float oldLo = na
+    var bool hiBroken = false
+    var bool loBroken = false
+    var int bias = 0
+    bool up = not na(hi) and not hiBroken and close > hi + rg_breakBuffer * rg_atr
+    bool down = not na(lo) and not loBroken and close < lo - rg_breakBuffer * rg_atr
+    if up and not down
+        bias := 1
+    if down and not up
+        bias := -1
+    if up
+        hiBroken := true
+    if down
+        loBroken := true
+    if not na(ph)
+        oldHi := hi
+        hi := ph
+        hiBroken := close > hi
+    if not na(pl)
+        oldLo := lo
+        lo := pl
+        loBroken := close < lo
+    if bias == 0 and not na(oldHi) and not na(oldLo)
+        bias := hi > oldHi and lo > oldLo ? 1 : hi < oldHi and lo < oldLo ? -1 : 0
+    [bias, hi, lo, hiBroken, loBroken]
+[rg_internalBias, rg_internalHigh, rg_internalLow, rg_internalHB, rg_internalLB] = rg_f_structure()
+
+type rg_Setup
+    int side = 0
+    int phase = 0
+    string model = ""
+    string id = ""
+    string reason = "Sweep bekleniyor"
+    int rangeId = na
+    int createdBar = na
+    int returnBar = na
+    int breakBar = na
+    int touchBar = na
+    int technicalEnd = na
+    int holdEnd = na
+    int terminalBar = na
+    float rh = na
+    float rl = na
+    float eq = na
+    float extreme = na
+    float stop = na
+    float breakLevel = na
+    float breakAtr = na
+    float bandLow = na
+    float bandHigh = na
+    float entry = na
+    float technicalPrice = na
+    float rr1 = na
+    float rr2 = na
+
+var rg_Setup rg_s = rg_Setup.new()
+var box rg_rangeBox = na
+var int rg_drawnRangeId = na
+rg_f_price(float v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+rg_f_phase(int p) =>
+    p == 1 ? "Range'e donus" : p == 2 ? "Onay bekliyor" : p == 3 ? "Ilk retest" : p == 4 ? "Retest tepkisi" : p == 5 ? "HTF kapanisi" : p == 6 ? "HAZIR" : p == 7 ? "IPTAL" : p == 8 ? "SURE DOLDU" : "Sweep bekliyor"
+method rg_finish(rg_Setup x, int phase, string reason) =>
+    x.phase := phase
+    x.reason := reason
+    x.terminalBar := bar_index
+method rg_technical(rg_Setup x, string reason) =>
+    x.phase := 5
+    x.technicalEnd := time_close
+    x.technicalPrice := close
+    x.reason := reason
+rg_f_notice(rg_Setup x, string event) =>
+    ""
+
+bool rg_readyLong = false
+bool rg_readyShort = false
+bool rg_cancelled = false
+bool rg_expired = false
+string rg_messages = ""
+if barstate.isconfirmed
+    if rg_newH
+        if rg_hAlive and (na(rg_drawnRangeId) or rg_hId != rg_drawnRangeId)
+            if not na(rg_rangeBox)
+                box.set_extend(rg_rangeBox, extend.none)
+                box.set_right(rg_rangeBox, time)
+            rg_drawnRangeId := rg_hId
+            if rg_showRange
+                rg_rangeBox := box.new(left = time, top = rg_hRH, right = time_close, bottom = rg_hRL, xloc = xloc.bar_time, extend = extend.right, border_color = color.blue, bgcolor = color.new(color.blue, 94))
+        if not rg_hAlive and rg_hAlive[1] and not na(rg_rangeBox)
+            box.set_extend(rg_rangeBox, extend.none)
+            box.set_right(rg_rangeBox, time)
+            box.set_bgcolor(rg_rangeBox, color.new(color.gray, 96))
+
+    bool active = rg_s.phase >= 1 and rg_s.phase <= 5
+    if active and bar_index > rg_s.createdBar
+        bool rangeLost = not rg_hAlive or rg_hId != rg_s.rangeId
+        bool extremeLost = rg_s.phase >= 2 and (rg_s.side == 1 ? low < rg_s.extreme : high > rg_s.extreme)
+        bool returnLost = rg_s.phase >= 2 and (close <= rg_s.rl or close >= rg_s.rh)
+        bool eqHit = rg_s.side == 1 ? high >= rg_s.eq : low <= rg_s.eq
+        bool bothSides = low < rg_s.rl and high > rg_s.rh
+        bool timedOut = rg_s.phase == 1 ? bar_index - rg_s.createdBar > rg_returnWait : rg_s.phase == 2 and rg_s.model == "3A" ? bar_index - rg_s.returnBar > rg_chochWait : rg_s.phase == 3 ? bar_index - rg_s.breakBar > rg_retestWait : rg_s.phase == 4 ? bar_index - rg_s.touchBar >= rg_reactionBars : rg_s.phase == 5 ? time > rg_s.technicalEnd + 2 * rg_rangeSeconds * 1000 : false
+        if rangeLost or extremeLost or returnLost or eqHit or bothSides
+            rg_s.rg_finish(7, rangeLost ? "Range HTF kapanisiyla kaybedildi / omru doldu" : extremeLost ? "Donus sonrasi sweep ucu yeniden ihlal edildi" : returnLost ? "Geri donus sonrasi range disinda kapanis" : eqHit ? "Giris oncesinde ilk hedef EQ goruldu" : "Ayni mum iki range sinirini supurdu")
+            rg_cancelled := true
+            rg_messages += rg_f_notice(rg_s, "IPTAL")
+        else if timedOut
+            rg_s.rg_finish(8, "Bu asamanin bekleme suresi doldu")
+            rg_expired := true
+            rg_messages += rg_f_notice(rg_s, "SURE DOLDU")
+        else
+            if rg_s.phase == 1
+                rg_s.extreme := rg_s.side == 1 ? math.min(rg_s.extreme, low) : math.max(rg_s.extreme, high)
+                if close > rg_s.rl and close < rg_s.rh
+                    float reference = rg_s.side == 1 ? rg_internalHigh[1] : rg_internalLow[1]
+                    bool intact = rg_s.side == 1 ? not rg_internalHB[1] : not rg_internalLB[1]
+                    bool notPassed = (reference - close) * rg_s.side > 0
+                    bool firstTargetSeen = rg_s.side == 1 ? high >= rg_s.eq : low <= rg_s.eq
+                    if rg_internalBias[1] == -rg_s.side and intact and not na(reference) and notPassed and not firstTargetSeen
+                        rg_s.phase := 2
+                        rg_s.returnBar := bar_index
+                        rg_s.holdEnd := rg_containingHtfEnd
+                        rg_s.stop := rg_s.extreme - rg_s.side * math.max(rg_stopBuffer * rg_atr, syminfo.mintick)
+                        rg_s.breakLevel := reference
+                        rg_s.reason := "Range'e donus; sabit karsi internal seviyede ChoCh bekleniyor"
+                        rg_messages += rg_f_notice(rg_s, "GERI DONUS")
+                    else
+                        rg_s.rg_finish(7, firstTargetSeen ? "Donus mumunda EQ goruldu" : "Donuste ters internal yapi / kirilmamis ChoCh esigi yok")
+                        rg_cancelled := true
+                        rg_messages += rg_f_notice(rg_s, "IPTAL")
+
+            if rg_s.phase == 2 and rg_s.model == "3C"
+                // Exactly the next chart candle, not any later green/red candle.
+                if bar_index == rg_s.createdBar + 1 and (close - open) * rg_s.side > 0
+                    rg_s.rg_technical("SFP sonrasi ilk mum yonlu kapandi")
+                    rg_messages += rg_f_notice(rg_s, "TEKNIK ONAY")
+                else
+                    rg_s.rg_finish(7, "SFP sonrasi ilk mum yonlu onay vermedi")
+                    rg_cancelled := true
+                    rg_messages += rg_f_notice(rg_s, "IPTAL")
+
+            if rg_s.phase == 2 and rg_s.model == "3A" and bar_index > rg_s.returnBar
+                bool cross = rg_s.side == 1 ? close > rg_s.breakLevel and close[1] <= rg_s.breakLevel : close < rg_s.breakLevel and close[1] >= rg_s.breakLevel
+                if cross
+                    float body = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+                    bool strong = (close - open) * rg_s.side > 0 and body >= rg_breakBody and high - low >= rg_breakRange * rg_atr and (close - rg_s.breakLevel) * rg_s.side >= rg_breakBuffer * rg_atr
+                    if strong
+                        rg_s.phase := 3
+                        rg_s.breakBar := bar_index
+                        rg_s.breakAtr := rg_atr
+                        rg_s.bandLow := rg_s.breakLevel - rg_retestHalfWidth * rg_atr
+                        rg_s.bandHigh := rg_s.breakLevel + rg_retestHalfWidth * rg_atr
+                        rg_s.reason := "ChoCh teyit edildi; ilk retest bekleniyor"
+                        rg_messages += rg_f_notice(rg_s, "CHOCH")
+                    else
+                        rg_s.rg_finish(7, "Ilk yapi gecisi ChoCh govde / aralik sartini saglamadi")
+                        rg_cancelled := true
+                        rg_messages += rg_f_notice(rg_s, "IPTAL")
+
+            if rg_s.phase == 3 and bar_index > rg_s.breakBar and low <= rg_s.bandHigh and high >= rg_s.bandLow
+                rg_s.phase := 4
+                rg_s.touchBar := bar_index
+                rg_s.reason := "Ilk retest temasi"
+                rg_messages += rg_f_notice(rg_s, "RETEST")
+            if rg_s.phase == 4
+                bool bandLost = rg_s.side == 1 ? close < rg_s.bandLow : close > rg_s.bandHigh
+                bool held = (close - rg_s.breakLevel) * rg_s.side > 0 and (close - open) * rg_s.side > 0
+                bool tooFar = rg_s.side == 1 ? close > rg_s.bandHigh + rg_maximumChase * rg_s.breakAtr : close < rg_s.bandLow - rg_maximumChase * rg_s.breakAtr
+                if bandLost or tooFar
+                    rg_s.rg_finish(7, bandLost ? "Ilk retest bandi kapanisla kaybedildi" : "Retest kapanisi banttan fazla uzak")
+                    rg_cancelled := true
+                    rg_messages += rg_f_notice(rg_s, "IPTAL")
+                else if held
+                    rg_s.rg_technical("Ilk retest tepkisi teyit edildi")
+                    rg_messages += rg_f_notice(rg_s, "TEKNIK ONAY")
+
+            if rg_s.phase == 5
+                bool holdConfirmed = not rg_waitHtfClose or (rg_hEnd >= rg_s.holdEnd and rg_hAlive and rg_hId == rg_s.rangeId)
+                if holdConfirmed
+                    float risk = (close - rg_s.stop) * rg_s.side
+                    float reward1 = (rg_s.eq - close) * rg_s.side
+                    float reward2 = ((rg_s.side == 1 ? rg_s.rh : rg_s.rl) - close) * rg_s.side
+                    rg_s.entry := close
+                    rg_s.rr1 := risk > 0 ? reward1 / risk : na
+                    rg_s.rr2 := risk > 0 ? reward2 / risk : na
+                    float selectedRR = rg_rrTarget == "EQ" ? rg_s.rr1 : rg_s.rr2
+                    if risk > 0 and reward1 > 0 and selectedRR >= rg_minimumRR
+                        bool delayed = time_close > rg_s.technicalEnd
+                        rg_s.rg_finish(6, delayed ? "HTF kapanisi korundu; alarm kapanisiyla R/R yenilendi" : rg_waitHtfClose ? "Teknik onay ve HTF kapanis kosulu tamam" : "Teknik onay tamam; gelismekte olan HTF kapanisi beklenmedi")
+                        rg_readyLong := rg_s.side == 1
+                        rg_readyShort := rg_s.side == -1
+                        rg_messages += rg_f_notice(rg_s, "HAZIR")
+                    else
+                        rg_s.rg_finish(7, "Alarm kapanisinda hedef yonu veya minimum R/R uygun degil")
+                        rg_cancelled := true
+                        rg_messages += rg_f_notice(rg_s, "IPTAL")
+
+    bool available = rg_s.phase == 0 or (rg_s.phase >= 6 and bar_index - rg_s.terminalBar >= rg_cooldownBars)
+    bool previouslyInside = close[1] > rg_hRL and close[1] < rg_hRH
+    if available and rg_hAlive and not na(rg_atr) and previouslyInside
+        float minSweep = math.max(rg_sweepMinimum * rg_atr, syminfo.mintick)
+        bool sweptLow = low < rg_hRL - minSweep
+        bool sweptHigh = high > rg_hRH + minSweep
+        int side = sweptLow and not sweptHigh ? 1 : sweptHigh and not sweptLow ? -1 : 0
+        bool directionOK = rg_directionInput == "Iki yon" or (side == 1 and rg_directionInput == "Long") or (side == -1 and rg_directionInput == "Short")
+        bool closedInside = close > rg_hRL and close < rg_hRH
+        bool bodyInside = open >= rg_hRL and open <= rg_hRH and closedInside
+        bool closedOutside = side == 1 ? close < rg_hRL : close > rg_hRH
+        bool sfp = side != 0 and bodyInside and rg_use3C
+        bool deviation = side != 0 and closedOutside and rg_use3A
+        bool bothBoundaries = low < rg_hRL and high > rg_hRH
+        bool targetUntouched = side == 1 ? high < (rg_hRH + rg_hRL) / 2 : low > (rg_hRH + rg_hRL) / 2
+        if directionOK and not bothBoundaries and targetUntouched and (sfp or deviation)
+            rg_s.side := side
+            rg_s.model := sfp ? "3C" : "3A"
+            rg_s.phase := sfp ? 2 : 1
+            rg_s.id := rg_s.model + "-" + str.tostring(rg_hId) + "-" + str.tostring(time_close) + "-" + str.tostring(side)
+            rg_s.rangeId := rg_hId
+            rg_s.reason := sfp ? "SFP tespit edildi; hemen sonraki grafik mumu bekleniyor" : "Range disinda kapanis; iceri donus bekleniyor"
+            rg_s.createdBar := bar_index
+            rg_s.returnBar := sfp ? bar_index : na
+            rg_s.breakBar := na
+            rg_s.touchBar := na
+            rg_s.technicalEnd := na
+            rg_s.holdEnd := sfp ? rg_containingHtfEnd : na
+            rg_s.rh := rg_hRH
+            rg_s.rl := rg_hRL
+            rg_s.eq := (rg_hRH + rg_hRL) / 2
+            rg_s.extreme := side == 1 ? low : high
+            rg_s.stop := sfp ? rg_s.extreme - side * math.max(rg_stopBuffer * rg_atr, syminfo.mintick) : na
+            rg_s.breakLevel := na
+            rg_s.breakAtr := na
+            rg_s.bandLow := na
+            rg_s.bandHigh := na
+            rg_s.entry := na
+            rg_s.technicalPrice := na
+            rg_s.rr1 := na
+            rg_s.rr2 := na
+            rg_messages += rg_f_notice(rg_s, sfp ? "SFP" : "SAPMA")
+
+// ==================== ONE NOTIFICATION ROUTER ====================
+type MonitorEvent
+    string model
+    int side
+    string setupId
+    float reference
+    float stop
+    float target1
+    float target2
+    float rr
+    string reason
+
+var array<MonitorEvent> monEvents = array.new<MonitorEvent>()
+f_mon_price(float price) =>
+    na(price) ? "-" : str.tostring(price, format.mintick)
+f_mon_side(int side) =>
+    side == 1 ? "LONG" : side == -1 ? "SHORT" : "IKI YON"
+f_mon_row(MonitorEvent e) =>
+    string result = e.model + " | " + f_mon_side(e.side) + " | referans=" + f_mon_price(e.reference)
+    result += " | stop=" + f_mon_price(e.stop) + " | hedef=" + f_mon_price(e.target1)
+    if not na(e.target2)
+        result += " | hedef2=" + f_mon_price(e.target2)
+    result += " | RR=" + str.tostring(e.rr, "#.##") + "\n" + e.reason + " | id=" + e.setupId
+    result
+
+var int monLastBar = na
+var int monFocusBar = na
+var int monLastSide = 0
+var string monLastTitle = "Henuz bildirim yok"
+var string monLastTime = "-"
+var string monFocusStatus = "-"
+var string monFocusModel = "-"
+var int monFocusSide = 0
+var float monFocusReference = na
+var float monFocusStop = na
+var float monFocusTarget = na
+var float monFocusTarget2 = na
+bool monSentReady = false
+bool monSentWatch = false
+bool monConflict = false
+string monMessage = ""
+
+if barstate.isconfirmed
+    array.clear(monEvents)
+    // This is a last-alert reference card, not simulated position management.
+    if not na(monFocusBar) and bar_index > monFocusBar and monFocusStatus == "Yeni aday; grafigi kontrol et"
+        bool stopSeen = monFocusSide == 1 ? low <= monFocusStop : high >= monFocusStop
+        bool targetSeen = monFocusSide == 1 ? high >= monFocusTarget : low <= monFocusTarget
+        if stopSeen or targetSeen
+            monFocusStatus := stopSeen and targetSeen ? "Stop ve ilk hedef ayni mumda goruldu" : stopSeen ? "Stop referansi goruldu" : "Ilk hedef referansi goruldu"
+        else if bar_index - monFocusBar >= monKeepBars
+            monFocusStatus := "Eski aday; yeniden degerlendir"
+
+    if mon1A and pb_readyLong
+        array.push(monEvents, MonitorEvent.new("1A Pullback", 1, pb_longSetup.id, pb_longSetup.entry, pb_longSetup.stop, pb_longSetup.target, na, pb_longSetup.rr, "HTF bolge + discount/OTE + ChoCh + HL tamamlandi"))
+    if mon1A and pb_readyShort
+        array.push(monEvents, MonitorEvent.new("1A Pullback", -1, pb_shortSetup.id, pb_shortSetup.entry, pb_shortSetup.stop, pb_shortSetup.target, na, pb_shortSetup.rr, "HTF bolge + discount/OTE + ChoCh + LH tamamlandi"))
+    if sw_readyLong
+        array.push(monEvents, MonitorEvent.new(sw_longSetup.model + " Sweep / retest", 1, sw_longSetup.id, sw_longSetup.entry, sw_longSetup.stop, sw_longSetup.target, na, sw_longSetup.rr, "Sweep + ChoCh + ilk retest tepkisi tamamlandi"))
+    if sw_readyShort
+        array.push(monEvents, MonitorEvent.new(sw_shortSetup.model + " Sweep / retest", -1, sw_shortSetup.id, sw_shortSetup.entry, sw_shortSetup.stop, sw_shortSetup.target, na, sw_shortSetup.rr, "Sweep + ChoCh + ilk retest tepkisi tamamlandi"))
+    if rg_readyLong or rg_readyShort
+        array.push(monEvents, MonitorEvent.new(rg_s.model + " Range", rg_s.side, rg_s.id, rg_s.entry, rg_s.stop, rg_s.eq, rg_s.side == 1 ? rg_s.rh : rg_s.rl, rg_s.rr1, rg_s.reason))
+
+    int total = array.size(monEvents)
+    if total > 0
+        bool hasLong = false
+        bool hasShort = false
+        string modelList = ""
+        for i = 0 to total - 1
+            MonitorEvent e = array.get(monEvents, i)
+            hasLong := hasLong or e.side == 1
+            hasShort := hasShort or e.side == -1
+            modelList += (i == 0 ? "" : " + ") + e.model
+        monConflict := hasLong and hasShort
+        monLastSide := monConflict ? 0 : hasLong ? 1 : -1
+        monLastTitle := monConflict ? "YON CELISKISI | " + modelList : "KONTROL ET | " + modelList
+        monLastTime := str.format_time(time_close, "yyyy-MM-dd HH:mm", "Europe/Istanbul") + " TR"
+        monMessage := "MPA MONITOR | " + syminfo.tickerid + " | " + f_mon_side(monLastSide) + "\n" + monLastTitle
+        monMessage += "\nGrafik: " + timeframe.period + "m | " + monLastTime
+        for i = 0 to total - 1
+            monMessage += "\n\n" + f_mon_row(array.get(monEvents, i))
+        monMessage += "\n\nWO=" + f_mon_price(rd_wo) + " | MO=" + f_mon_price(rd_mo)
+        monMessage += monConflict ? "\nModeller ayni mumda ters yon verdi; tek yonlu aday kabul etme." : "\nOnay anindaki adaydir. Grafigi acip guncel fiyati ve yapinin korunmasini kontrol et."
+        monSentReady := true
+        monLastBar := bar_index
+        // One representative for chart levels; all setups retain separate levels in the alert.
+        // Ordering is deterministic: 1A, 4A/5A, range. No probability ranking is implied.
+        if not monConflict
+            MonitorEvent focus = array.get(monEvents, 0)
+            monFocusBar := bar_index
+            monFocusModel := focus.model
+            monFocusSide := focus.side
+            monFocusReference := focus.reference
+            monFocusStop := focus.stop
+            monFocusTarget := focus.target1
+            monFocusTarget2 := focus.target2
+            monFocusStatus := "Yeni aday; grafigi kontrol et"
+        else
+            monFocusBar := na
+            monFocusModel := "Ayni mumda ters yonler"
+            monFocusStatus := "Tek yonlu seviye karti kapatildi"
+            monFocusReference := na
+            monFocusStop := na
+            monFocusTarget := na
+            monFocusTarget2 := na
+    else if monEarly and (rd_fireLong or rd_fireShort)
+        int side = rd_fireLong ? 1 : -1
+        bool weekly = side == 1 ? rd_wl and (not rd_ml or rd_wlScore >= rd_mlScore) : rd_ws and (not rd_ms or rd_wsScore >= rd_msScore)
+        float anchor = weekly ? rd_wo : rd_mo
+        string reasons = side == 1 ? (weekly ? rd_wlWhy : rd_mlWhy) : (weekly ? rd_wsWhy : rd_msWhy)
+        int score = side == 1 ? (weekly ? rd_wlScore : rd_mlScore) : (weekly ? rd_wsScore : rd_msScore)
+        monLastSide := side
+        monLastTitle := "BOLGE TEMASI | " + (weekly ? "WO" : "MO") + reasons
+        monLastTime := str.format_time(time_close, "yyyy-MM-dd HH:mm", "Europe/Istanbul") + " TR"
+        monLastBar := bar_index
+        monMessage := "MPA MONITOR | " + syminfo.tickerid + " | " + f_mon_side(side) + "\n" + monLastTitle
+        monMessage += "\n" + monLastTime + " | Grafik: " + timeframe.period + "m | kesisim=" + str.tostring(score) + "/4"
+        monMessage += "\nSeviye=" + f_mon_price(anchor) + " | yakinlik +/- " + f_mon_price(rd_tolerance) + " | kapanis=" + f_mon_price(close)
+        monMessage += "\nErken bolge uyarisi. Giris onayi, yapisal stop veya hedef henuz yok."
+        monSentWatch := true
+
+    // Exactly one dynamic alert endpoint. Simultaneous models cannot swallow each other.
+    if str.length(monMessage) > 0
+        alert(monMessage, alert.freq_once_per_bar_close)
+        if monShowLabels
+            label.new(bar_index, monLastSide == 1 ? low : high, monSentWatch ? "BOLGE" : monConflict ? "IKI YON" : "KONTROL ET", style = monLastSide == 1 ? label.style_label_up : label.style_label_down, color = monConflict ? color.gray : monSentWatch ? color.blue : monLastSide == 1 ? color.teal : color.orange, textcolor = color.white, size = size.small, tooltip = monMessage)
+
+bool monFocusVisible = not na(monFocusBar) and bar_index - monFocusBar < monKeepBars
+plot(monShowLevels ? rd_wo : na, "Weekly Open", color.yellow, style = plot.style_stepline)
+plot(monShowLevels ? rd_mo : na, "Monthly Open", color.fuchsia, style = plot.style_stepline)
+plot(monShowLevels and rg_hAlive ? rg_hRH : na, "Sabit Range High", color.new(color.orange, 30), style = plot.style_linebr)
+plot(monShowLevels and rg_hAlive ? rg_hRL : na, "Sabit Range Low", color.new(color.teal, 30), style = plot.style_linebr)
+plot(monShowLevels and rg_hAlive ? (rg_hRH + rg_hRL) / 2 : na, "Range EQ", color.gray, style = plot.style_linebr)
+plot(monFocusVisible ? monFocusReference : na, "Son onayli aday - referans", color.white, style = plot.style_linebr)
+plot(monFocusVisible ? monFocusStop : na, "Son onayli aday - stop", color.red, style = plot.style_linebr)
+plot(monFocusVisible ? monFocusTarget : na, "Son onayli aday - hedef 1", color.lime, style = plot.style_linebr)
+plot(monFocusVisible ? monFocusTarget2 : na, "Son onayli aday - hedef 2", color.new(color.lime, 40), style = plot.style_linebr)
+
+f_mon_cell(table panel, int row, string labelText, string value, color ink) =>
+    table.cell(panel, 0, row, labelText, text_color = color.silver, text_size = size.small)
+    table.cell(panel, 1, row, value, text_color = ink, text_size = size.small)
+var table monPanel = table.new(position.top_right, 2, 11, bgcolor = color.new(color.black, 12), border_width = 1)
+if barstate.islast and monShowPanel
+    f_mon_cell(monPanel, 0, "MPA MARKET MONITOR", syminfo.ticker + " | " + timeframe.period + "m", color.white)
+    f_mon_cell(monPanel, 1, "Piyasa", sw_regimeText, color.white)
+    string pullbackState = mon1A ? ("L: " + pb_f_phase(pb_longSetup.phase) + " | S: " + pb_f_phase(pb_shortSetup.phase)) : "Kapali"
+    f_mon_cell(monPanel, 2, "1A Pullback", pullbackState, color.white)
+    string sweepState = mon4A or mon5A ? (sw_longSetup.model + " L: " + sw_f_phase(sw_longSetup.phase) + " | " + sw_shortSetup.model + " S: " + sw_f_phase(sw_shortSetup.phase)) : "Kapali"
+    f_mon_cell(monPanel, 3, "4A / 5A", sweepState, color.white)
+    string rangeState = mon3A or mon3C ? (rg_hAlive ? rg_s.model + " " + rg_f_phase(rg_s.phase) : "Otomatik range araniyor") : "Kapali"
+    f_mon_cell(monPanel, 4, "3A / 3C", rangeState, color.white)
+    f_mon_cell(monPanel, 5, "Bildirim modu", monMode, color.white)
+    f_mon_cell(monPanel, 6, "Son bildirim", monLastTitle + " | " + monLastTime, color.yellow)
+    f_mon_cell(monPanel, 7, "Son onayli aday", monFocusModel + " | " + monFocusStatus, color.white)
+    f_mon_cell(monPanel, 8, "Referans / stop", f_mon_price(monFocusReference) + " / " + f_mon_price(monFocusStop), color.white)
+    f_mon_cell(monPanel, 9, "Hedef 1 / 2", f_mon_price(monFocusTarget) + " / " + f_mon_price(monFocusTarget2), color.white)
+    f_mon_cell(monPanel, 10, "Alarm kurulumu", "Any alert() function call | uygulama bildirimi", color.silver)

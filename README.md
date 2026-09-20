@@ -1,18 +1,15 @@
-# Price action alarm scriptleri
+# MPA Market Monitor
 
-Notlardan ve `Trading-Playbook-v3.docx` içeriğinden türetilen bağımsız **Pine Script v6 indicator** dosyaları.
+**Kullanacağın tek dosya: [pa_market_monitor.pine](pine/pa_market_monitor.pine).**
 
-| Script | Kapsam | Açıklama |
-|---|---|---|
-| [WO/MO kesişim radarı](pine/pa_confluence_radar.pine) | Otomatik SR, FVG, OB ve WO/MO yakınlığı | [alarm_plani.md](alarm_plani.md) |
-| [MTF + sweep/retest](pine/pa_playbook_engine.pine) | Daily–4H–45m swing/internal paneli; 4A ve 5A | [playbook_engine.md](playbook_engine.md) |
-| [HTF pullback](pine/pa_htf_pullback.pine) | 1A: demand/supply + discount/OTE → ChoCh → HL/LH | [pullback_range.md](pullback_range.md) |
-| [Range deviation / SFP](pine/pa_range_setups.pine) | 3A: çok mumlu sapma + ChoCh/retest; 3C: SFP + sonraki mum | [pullback_range.md](pullback_range.md) |
+Ekran başında olmadığında 1A pullback, 4A/5A sweep–retest, 3A deviation ve 3C SFP modellerini izler. Onaylı aday oluştuğunda model, yön, referans, stop ve hedefle bildirim üretir; grafiği açıp işlemi sen değerlendirirsin. WO/MO–SR–FVG–OB erken bölge uyarısı isteğe bağlıdır.
 
-Her dosyayı TradingView Pine Editor'de **ayrı indicator** olarak ekle. Varsayılan kullanım standart **5m grafik**; range scripti 15m grafikte de kullanılabilir. Grafik TF değişirse grafik mumlarıyla tanımlı tetik ve süreler de değişir.
+**Kurulum:** standart 5m grafik → tek dosyayı Pine Editor'e yapıştır → grafiğe ekle → **Any alert() function call** alarmı oluştur → uygulama bildirimini aç.
 
-Alarm için ilgili indicator altında **Any alert() function call** seç. Kod/input değişikliklerinden sonra alarmı yeniden oluştur. Aynı sinyal için ayrıca statik alarm kurmak çift bildirim verebilir. Ayrı scriptlerin aynı piyasa olayından ürettiği bildirimler arasında ortak tekilleştirme yoktur.
+[Kurulum ve kullanım açıklaması](monitor_kullanim.md). Diğer indicator dosyalarını ayrıca eklemen gerekmez. Önceden onlar için alarm kurduysan çift bildirim almamak için eski alarmları kapat.
 
-Bu dosyalar emir göndermez. `HAZIR`, scriptin koşullarını tamamlamış adaydır. Kaynaktaki yoruma açık tanımlar için seçilen kurallar ve kalan kapsam ilgili açıklama dosyalarında yazılıdır. Orijinal `strategy.md` değiştirilmemiştir.
+Script grafiğin sembolünü izler; bir sembol için tek alarm yeterlidir. Çoklu sembol kurulumu ve watchlist seçeneği kullanım açıklamasındadır. Emir göndermez, gerçek hesabı izlemez.
 
-**TradingView derlemesi, grafik ve canlı alarm doğrulaması kullanıcının tercihine göre kullanıcıya bırakılmıştır.** Başarılı derleme veya performans sonucu iddia edilmez.
+TradingView derlemesi ve canlı alarm doğrulaması henüz yapılmadı; hesabında alarm kurulmadı. Önceki tercihin doğrultusunda grafik doğrulaması sana ait.
+
+Eski dosyalar model kaynakları olarak korunuyor. Geliştirme sırasında `python3 scripts/build_monitor.py` tek gösterge dosyasını yeniden üretir; TradingView kullanımı için bu komutu çalıştırmak gerekmez. Orijinal `strategy.md` değiştirilmedi.
